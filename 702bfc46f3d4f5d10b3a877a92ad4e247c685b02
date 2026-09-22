@@ -1,0 +1,23 @@
+src/backend/winit/mod.rs
+  s_fa677c70dd8896 530-546,597-610
+---
+{
+  "base_commit_sha": "702bfc46f3d4f5d10b3a877a92ad4e247c685b02",
+  "git_ai_version": "1.7.5",
+  "prompts": {},
+  "schema_version": "authorship/3.0.0",
+  "sessions": {
+    "s_fa677c70dd8896": {
+      "agent_id": {
+        "id": "codex:gpt-6-astra",
+        "model": "gpt-6-astra",
+        "tool": "codex"
+      },
+      "custom_attributes": {
+        "ai_generated": "true",
+        "review_status": "unreviewed"
+      },
+      "human_author": null
+    }
+  }
+}
