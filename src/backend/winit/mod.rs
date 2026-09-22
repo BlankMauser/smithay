@@ -533,9 +533,10 @@ impl<F: FnMut(WinitEvent)> ApplicationHandler for WinitEventLoopApp<'_, F> {
                 ..
             } => {
                 let size = window.surface_size();
+                let time = self.timestamp();
                 (self.callback)(WinitEvent::Input(InputEvent::PointerMotionAbsolute {
                     event: WinitMouseMovedEvent {
-                        time: self.timestamp(),
+                        time,
                         position: RelativePosition::new(
                             position.x / size.width as f64,
                             position.y / size.height as f64,
@@ -598,9 +599,10 @@ impl<F: FnMut(WinitEvent)> ApplicationHandler for WinitEventLoopApp<'_, F> {
                         // immediately after entering a surface). Preserve the
                         // position supplied by winit before dispatching the button.
                         let size = window.surface_size();
+                        let time = self.timestamp();
                         (self.callback)(WinitEvent::Input(InputEvent::PointerMotionAbsolute {
                             event: WinitMouseMovedEvent {
-                                time: self.timestamp(),
+                                time,
                                 position: RelativePosition::new(
                                     position.x / size.width as f64,
                                     position.y / size.height as f64,
