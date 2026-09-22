@@ -527,6 +527,23 @@ impl<F: FnMut(WinitEvent)> ApplicationHandler for WinitEventLoopApp<'_, F> {
                 };
                 (self.callback)(WinitEvent::Input(event));
             }
+            WindowEvent::PointerEntered {
+                position,
+                kind: PointerKind::Mouse,
+                ..
+            } => {
+                let size = window.surface_size();
+                (self.callback)(WinitEvent::Input(InputEvent::PointerMotionAbsolute {
+                    event: WinitMouseMovedEvent {
+                        time: self.timestamp(),
+                        position: RelativePosition::new(
+                            position.x / size.width as f64,
+                            position.y / size.height as f64,
+                        ),
+                        global_position: position,
+                    },
+                }));
+            }
             WindowEvent::PointerMoved { position, source, .. } => {
                 let size = window.surface_size();
                 let x = position.x / size.width as f64;
@@ -577,6 +594,20 @@ impl<F: FnMut(WinitEvent)> ApplicationHandler for WinitEventLoopApp<'_, F> {
             } => {
                 match button {
                     ButtonSource::Mouse(button) => {
+                        // A click can arrive without a preceding move (for example
+                        // immediately after entering a surface). Preserve the
+                        // position supplied by winit before dispatching the button.
+                        let size = window.surface_size();
+                        (self.callback)(WinitEvent::Input(InputEvent::PointerMotionAbsolute {
+                            event: WinitMouseMovedEvent {
+                                time: self.timestamp(),
+                                position: RelativePosition::new(
+                                    position.x / size.width as f64,
+                                    position.y / size.height as f64,
+                                ),
+                                global_position: position,
+                            },
+                        }));
                         let event = InputEvent::PointerButton {
                             event: WinitMouseInputEvent {
                                 time: self.timestamp(),
