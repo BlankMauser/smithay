@@ -217,7 +217,8 @@ impl WgpuGraphicsBackend {
     #[profiling::function]
     pub fn submit(&mut self, _damage: Option<&[Rectangle<i32, Physical>]>) -> Result<(), SwapBuffersError> {
         let frame = self.acquired.take().ok_or(SwapBuffersError::AlreadySwapped)?;
-        self.window.pre_present_notify();
+        // Vulkan FIFO provides presentation pacing. Winit's additional Wayland
+        // frame-callback gate can leave redraws pending after presentation.
         self.renderer.queue().present(frame);
         if self.reconfigure_after_present {
             self.configured_size = None;
