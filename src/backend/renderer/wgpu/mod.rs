@@ -466,17 +466,15 @@ impl WgpuRenderer {
             }
         }
 
-        let mut resting = Vec::new();
-        for texture in &used {
-            if let Some(state) = texture.sync().and_then(|sync| sync.resting_state()) {
-                resting.push(::wgpu::TextureTransition {
-                    texture: texture.raw(),
-                    selector: None,
-                    state,
-                });
-            }
-        }
-        encoder.transition_resources(std::iter::empty(), resting.into_iter());
+        let resting = used.iter().filter_map(|texture| {
+            let state = texture.sync()?.resting_state()?;
+            Some(::wgpu::TextureTransition {
+                texture: texture.raw(),
+                selector: None,
+                state,
+            })
+        });
+        encoder.transition_resources(std::iter::empty(), resting);
         for (index, texture) in used.iter().enumerate() {
             if let Some(sync) = texture.sync() {
                 if let Err(err) = sync.acquire(&self.device, &self.queue, texture.raw()) {
@@ -744,7 +742,7 @@ impl Renderer for WgpuRenderer {
 }
 
 impl Bind<WgpuTexture> for WgpuRenderer {
-    fn bind<'a>(&mut self, target: &'a mut WgpuTexture) -> Result<WgpuTarget, WgpuError> {
+    fn bind(&mut self, target: &mut WgpuTexture) -> Result<WgpuTarget, WgpuError> {
         if target.context_id() != &self.context_id {
             return Err(WgpuError::ForeignTexture);
         }
@@ -776,7 +774,7 @@ impl Bind<WgpuTexture> for WgpuRenderer {
 
 #[cfg(unix)]
 impl Bind<Dmabuf> for WgpuRenderer {
-    fn bind<'a>(&mut self, target: &'a mut Dmabuf) -> Result<WgpuTarget, WgpuError> {
+    fn bind(&mut self, target: &mut Dmabuf) -> Result<WgpuTarget, WgpuError> {
         let interop = self
             .vulkan
             .as_ref()

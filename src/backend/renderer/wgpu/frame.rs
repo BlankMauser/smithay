@@ -9,6 +9,7 @@ use crate::{
 };
 
 impl WgpuFrame<'_> {
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn render_texture(
         &mut self,
         texture: &WgpuTexture,
