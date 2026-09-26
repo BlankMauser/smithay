@@ -65,6 +65,7 @@ wayland-server = { version = "0.31.13", optional = true }
 wayland-sys = { version = "0.31.11", optional = true }
 wayland-backend = { version = "0.3.15", optional = true }
 winit = { version = "=0.31.0-beta.3", default-features = false, features = ["wayland", "wayland-dlopen", "x11"], optional = true }
+wgpu = { version = "30.0.1", default-features = false, features = ["std", "vulkan", "wgsl"], optional = true }
 x11rb = { version = "0.13.0", optional = true, features = ["res", "sync"]}
 xkbcommon = { version = "0.9.0", features = ["wayland"]}
 encoding_rs = { version = "0.8.33", optional = true }
@@ -78,6 +79,7 @@ reis = { version = "0.7.0", features = ["calloop"] }
 glam = { version = "0.33.2", default-features = false, features = ["std"] }
 
 [dev-dependencies]
+pollster = "0.4"
 clap = { version = "4", features = ["derive"] }
 criterion = { version = "0.5" }
 image = "0.25"
@@ -108,6 +110,7 @@ renderer_gl = ["gl_generator", "backend_egl"]
 renderer_glow = ["renderer_gl", "glow"]
 renderer_multi = ["backend_drm", "aliasable"]
 renderer_pixman = ["pixman"]
+renderer_wgpu = ["dep:wgpu", "ash"]
 renderer_test = []
 tracy_gpu_profiling = ["renderer_gl", "tracy-client"]
 use_system_lib = ["wayland_frontend", "wayland-backend/server_system", "wayland-sys", "gbm?/import-wayland"]
@@ -132,6 +135,10 @@ required-features = ["wayland_frontend"]
 [[example]]
 name = "vulkan"
 required-features = ["backend_vulkan"]
+
+[[example]]
+name = "wgpu"
+required-features = ["renderer_wgpu"]
 
 [[example]]
 name = "buffer_test"
