@@ -1,0 +1,19 @@
+src/backend/winit/wgpu.rs
+  s_4c286d889ffe7e::t_bc3c2ba22f799a 220-221
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "25fdb01774e72b6f2b205956c63a28cb57d1f15d",
+  "prompts": {},
+  "sessions": {
+    "s_4c286d889ffe7e": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0d4cb-82c9-7df1-836a-73ee56cd5949",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "BlankMauser <thomasluvan@gmail.com>"
+    }
+  }
+}
