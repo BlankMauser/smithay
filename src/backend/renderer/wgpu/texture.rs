@@ -1,4 +1,7 @@
-use std::{fmt, sync::Arc};
+use std::{
+    fmt,
+    sync::{Arc, Mutex},
+};
 
 use drm_fourcc::DrmFourcc;
 
@@ -14,6 +17,15 @@ pub(super) fn format_to_wgpu(format: DrmFourcc) -> Result<::wgpu::TextureFormat,
         DrmFourcc::Abgr8888 | DrmFourcc::Xbgr8888 => Ok(::wgpu::TextureFormat::Rgba8Unorm),
         DrmFourcc::Abgr2101010 | DrmFourcc::Xbgr2101010 => Ok(::wgpu::TextureFormat::Rgb10a2Unorm),
         _ => Err(WgpuError::UnsupportedPixelFormat(format)),
+    }
+}
+
+pub(super) fn wgpu_to_format(format: ::wgpu::TextureFormat) -> Result<DrmFourcc, WgpuError> {
+    match format {
+        ::wgpu::TextureFormat::Bgra8Unorm => Ok(DrmFourcc::Argb8888),
+        ::wgpu::TextureFormat::Rgba8Unorm => Ok(DrmFourcc::Abgr8888),
+        ::wgpu::TextureFormat::Rgb10a2Unorm => Ok(DrmFourcc::Abgr2101010),
+        _ => Err(WgpuError::UnsupportedWgpuFormat(format)),
     }
 }
 
@@ -37,6 +49,7 @@ pub(crate) struct WgpuTextureInner {
     pub(crate) flipped: bool,
     pub(crate) context: ContextId<WgpuTexture>,
     pub(crate) sync: Option<Arc<dyn WgpuTextureSync>>,
+    bind_groups: Mutex<[Option<::wgpu::BindGroup>; 4]>,
 }
 
 pub(crate) trait WgpuTextureSync: fmt::Debug + Send + Sync {
@@ -124,6 +137,7 @@ impl WgpuTexture {
             flipped,
             context,
             sync,
+            bind_groups: Mutex::new(std::array::from_fn(|_| None)),
         }))
     }
 
@@ -143,8 +157,13 @@ impl WgpuTexture {
         self.0.wgpu_format
     }
 
-    pub(crate) fn flipped(&self) -> bool {
+    /// Returns whether the texture contents have an inverted y-axis.
+    pub fn is_y_inverted(&self) -> bool {
         self.0.flipped
+    }
+
+    pub(crate) fn flipped(&self) -> bool {
+        self.is_y_inverted()
     }
 
     pub(crate) fn sync(&self) -> Option<&Arc<dyn WgpuTextureSync>> {
@@ -158,6 +177,34 @@ impl WgpuTexture {
                 .and_then(|sync| sync.identity())
                 .zip(other.sync().and_then(|sync| sync.identity()))
                 .is_some_and(|(left, right)| left == right)
+    }
+
+    pub(super) fn bind_group(
+        &self,
+        index: usize,
+        device: &::wgpu::Device,
+        layout: &::wgpu::BindGroupLayout,
+        sampler: &::wgpu::Sampler,
+    ) -> ::wgpu::BindGroup {
+        let mut bind_groups = self.0.bind_groups.lock().unwrap();
+        bind_groups[index]
+            .get_or_insert_with(|| {
+                device.create_bind_group(&::wgpu::BindGroupDescriptor {
+                    label: Some("Smithay WGPU texture bind group"),
+                    layout,
+                    entries: &[
+                        ::wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: ::wgpu::BindingResource::TextureView(self.view()),
+                        },
+                        ::wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: ::wgpu::BindingResource::Sampler(sampler),
+                        },
+                    ],
+                })
+            })
+            .clone()
     }
 }
 

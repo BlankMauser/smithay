@@ -4,10 +4,11 @@
 //! On Linux, [`vulkan::request_device`] enables the extensions needed for DMA-BUF import and
 //! rendering into GBM buffers. Only single-plane, explicitly modified RGB buffers are supported.
 //!
-//! DMA-BUF operations wait for GPU completion before returning buffers to external users.
-//! [`WgpuFence`] supports CPU waits but does not export native synchronization files.
+//! DMA-BUF access exchanges native fences with the kernel's reservation objects and
+//! transfers Vulkan queue ownership. [`WgpuFence`] exports a sync file when supported;
+//! devices without native fence support use queue-completion callbacks instead.
 
-use std::{collections::HashMap, mem, ops::Range};
+use std::{collections::HashMap, marker::PhantomData, mem, ops::Range};
 
 use drm_fourcc::{DrmFormat, DrmFourcc, DrmModifier};
 
@@ -43,17 +44,21 @@ use crate::{
     wayland::compositor::SurfaceData,
 };
 
+mod custom;
 mod error;
 mod frame;
 mod sync;
 mod texture;
+mod uniform;
 #[cfg(unix)]
 /// Vulkan device creation and DMA-BUF interoperability.
 pub mod vulkan;
 
+pub use custom::{WgpuPixelProgram, WgpuTexProgram};
 pub use error::WgpuError;
 pub use sync::WgpuFence;
 pub use texture::{WgpuMapping, WgpuTexture};
+pub use uniform::{Uniform, UniformName, UniformType, UniformValue};
 
 const MEM_FORMATS: &[DrmFourcc] = &[
     DrmFourcc::Argb8888,
@@ -73,11 +78,83 @@ struct Vertex {
     force_opaque: f32,
 }
 
+const VERTEX_ATTRIBUTES: [::wgpu::VertexAttribute; 4] = [
+    ::wgpu::VertexAttribute {
+        format: ::wgpu::VertexFormat::Float32x2,
+        offset: 0,
+        shader_location: 0,
+    },
+    ::wgpu::VertexAttribute {
+        format: ::wgpu::VertexFormat::Float32x2,
+        offset: 8,
+        shader_location: 1,
+    },
+    ::wgpu::VertexAttribute {
+        format: ::wgpu::VertexFormat::Float32x4,
+        offset: 16,
+        shader_location: 2,
+    },
+    ::wgpu::VertexAttribute {
+        format: ::wgpu::VertexFormat::Float32,
+        offset: 32,
+        shader_location: 3,
+    },
+];
+
+fn vertex_buffer_layout() -> ::wgpu::VertexBufferLayout<'static> {
+    ::wgpu::VertexBufferLayout {
+        array_stride: mem::size_of::<Vertex>() as u64,
+        step_mode: ::wgpu::VertexStepMode::Vertex,
+        attributes: &VERTEX_ATTRIBUTES,
+    }
+}
+
+fn align_up(value: usize, alignment: usize) -> Option<usize> {
+    let alignment = alignment.max(1);
+    value
+        .checked_add(alignment - 1)
+        .map(|value| value / alignment * alignment)
+}
+
+fn create_uniform_bind_group(
+    device: &::wgpu::Device,
+    layout: &::wgpu::BindGroupLayout,
+    buffer: &::wgpu::Buffer,
+) -> ::wgpu::BindGroup {
+    device.create_bind_group(&::wgpu::BindGroupDescriptor {
+        label: Some("Smithay WGPU custom uniform bind group"),
+        layout,
+        entries: &[::wgpu::BindGroupEntry {
+            binding: 0,
+            resource: ::wgpu::BindingResource::Buffer(::wgpu::BufferBinding {
+                buffer,
+                offset: 0,
+                size: std::num::NonZeroU64::new(custom::UNIFORM_SIZE),
+            }),
+        }],
+    })
+}
+
 #[derive(Debug)]
 enum DrawKind {
     Replace,
     Solid,
-    Texture { texture: WgpuTexture, opaque: bool },
+    SolidMultiply,
+    Texture {
+        texture: WgpuTexture,
+        opaque: bool,
+    },
+    CustomTexture {
+        texture: WgpuTexture,
+        program: WgpuTexProgram,
+        blend: bool,
+        uniform_offset: u32,
+    },
+    CustomPixel {
+        program: WgpuPixelProgram,
+        blend: bool,
+        uniform_offset: u32,
+    },
 }
 
 #[derive(Debug)]
@@ -90,24 +167,26 @@ struct Draw {
 struct Pipelines {
     replace: ::wgpu::RenderPipeline,
     solid: ::wgpu::RenderPipeline,
+    solid_multiply: ::wgpu::RenderPipeline,
     texture: ::wgpu::RenderPipeline,
     texture_opaque: ::wgpu::RenderPipeline,
 }
 
 /// A framebuffer backed by a WGPU texture.
 #[derive(Debug, Clone)]
-pub struct WgpuTarget {
+pub struct WgpuTarget<'buffer> {
     texture: WgpuTexture,
+    buffer: PhantomData<&'buffer mut ()>,
 }
 
-impl WgpuTarget {
+impl WgpuTarget<'_> {
     /// Returns the texture backing this framebuffer.
     pub fn texture(&self) -> &WgpuTexture {
         &self.texture
     }
 }
 
-impl Texture for WgpuTarget {
+impl Texture for WgpuTarget<'_> {
     fn width(&self) -> u32 {
         self.texture.width()
     }
@@ -134,6 +213,16 @@ pub struct WgpuRenderer {
     min_filter: TextureFilter,
     mag_filter: TextureFilter,
     texture_layout: ::wgpu::BindGroupLayout,
+    _dummy_texture: ::wgpu::Texture,
+    dummy_bind_groups: [::wgpu::BindGroup; 4],
+    uniform_layout: ::wgpu::BindGroupLayout,
+    uniform_buffer: ::wgpu::Buffer,
+    uniform_bind_group: ::wgpu::BindGroup,
+    uniform_stride: usize,
+    uniform_capacity: usize,
+    uniform_data: Vec<u8>,
+    prepared_pipelines: Vec<Option<::wgpu::RenderPipeline>>,
+    prepared_bind_groups: Vec<Option<::wgpu::BindGroup>>,
     samplers: [[::wgpu::Sampler; 2]; 2],
     shader: ::wgpu::ShaderModule,
     pipelines: HashMap<::wgpu::TextureFormat, Pipelines>,
@@ -141,6 +230,8 @@ pub struct WgpuRenderer {
     vertex_capacity: usize,
     vertices: Vec<Vertex>,
     draws: Vec<Draw>,
+    non_opaque_damage: Vec<Rectangle<i32, Physical>>,
+    opaque_damage: Vec<Rectangle<i32, Physical>>,
     #[cfg(unix)]
     vulkan: Option<vulkan::VulkanInterop>,
 }
@@ -180,6 +271,33 @@ impl WgpuRenderer {
                 },
             ],
         });
+        let uniform_layout = device.create_bind_group_layout(&::wgpu::BindGroupLayoutDescriptor {
+            label: Some("Smithay WGPU custom uniform layout"),
+            entries: &[::wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: ::wgpu::ShaderStages::FRAGMENT,
+                ty: ::wgpu::BindingType::Buffer {
+                    ty: ::wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: true,
+                    min_binding_size: std::num::NonZeroU64::new(custom::UNIFORM_SIZE),
+                },
+                count: None,
+            }],
+        });
+        let uniform_alignment = device.limits().min_uniform_buffer_offset_alignment as usize;
+        let uniform_stride =
+            align_up(custom::UNIFORM_SIZE as usize, uniform_alignment).ok_or(WgpuError::InvalidRegion)?;
+        let uniform_capacity = uniform_stride.checked_mul(64).ok_or(WgpuError::InvalidRegion)?;
+        if uniform_capacity as u64 > device.limits().max_buffer_size {
+            return Err(WgpuError::InvalidRegion);
+        }
+        let uniform_buffer = device.create_buffer(&::wgpu::BufferDescriptor {
+            label: Some("Smithay WGPU custom uniform buffer"),
+            size: uniform_capacity as u64,
+            usage: ::wgpu::BufferUsages::UNIFORM | ::wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let uniform_bind_group = create_uniform_bind_group(&device, &uniform_layout, &uniform_buffer);
         let sampler = |label, min_filter, mag_filter| {
             device.create_sampler(&::wgpu::SamplerDescriptor {
                 label: Some(label),
@@ -214,6 +332,37 @@ impl WgpuRenderer {
                 ),
             ],
         ];
+        let dummy_texture = device.create_texture(&::wgpu::TextureDescriptor {
+            label: Some("Smithay WGPU dummy texture"),
+            size: ::wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: ::wgpu::TextureDimension::D2,
+            format: ::wgpu::TextureFormat::Rgba8Unorm,
+            usage: ::wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let dummy_view = dummy_texture.create_view(&Default::default());
+        let dummy_bind_groups = std::array::from_fn(|index| {
+            device.create_bind_group(&::wgpu::BindGroupDescriptor {
+                label: Some("Smithay WGPU dummy texture bind group"),
+                layout: &texture_layout,
+                entries: &[
+                    ::wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: ::wgpu::BindingResource::TextureView(&dummy_view),
+                    },
+                    ::wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: ::wgpu::BindingResource::Sampler(&samplers[index / 2][index % 2]),
+                    },
+                ],
+            })
+        });
         let shader = device.create_shader_module(::wgpu::ShaderModuleDescriptor {
             label: Some("Smithay WGPU renderer shader"),
             source: ::wgpu::ShaderSource::Wgsl(include_str!("shaders.wgsl").into()),
@@ -243,6 +392,16 @@ impl WgpuRenderer {
             min_filter: TextureFilter::Linear,
             mag_filter: TextureFilter::Linear,
             texture_layout,
+            _dummy_texture: dummy_texture,
+            dummy_bind_groups,
+            uniform_layout,
+            uniform_buffer,
+            uniform_bind_group,
+            uniform_stride,
+            uniform_capacity,
+            uniform_data: Vec::with_capacity(uniform_capacity),
+            prepared_pipelines: Vec::with_capacity(64),
+            prepared_bind_groups: Vec::with_capacity(64),
             samplers,
             shader,
             pipelines: HashMap::new(),
@@ -250,6 +409,8 @@ impl WgpuRenderer {
             vertex_capacity,
             vertices: Vec::with_capacity(vertex_capacity),
             draws: Vec::with_capacity(64),
+            non_opaque_damage: Vec::with_capacity(16),
+            opaque_damage: Vec::with_capacity(16),
             #[cfg(unix)]
             vulkan,
         })
@@ -263,6 +424,112 @@ impl WgpuRenderer {
     /// Returns the WGPU queue used by this renderer.
     pub fn queue(&self) -> &::wgpu::Queue {
         &self.queue
+    }
+
+    /// Compiles a custom WGSL texture shader.
+    ///
+    /// The source must declare a `CustomUniforms` block at group 1, binding 0 and a
+    /// `custom_fragment` fragment entry point. Group 0 contains `source_texture` and
+    /// `source_sampler`. Slot 0 of the uniform block is reserved for the target size,
+    /// alpha and debug tint flag; additional uniforms occupy slots in declaration order.
+    pub fn compile_custom_texture_shader(
+        &mut self,
+        source: impl AsRef<str>,
+        additional_uniforms: &[UniformName<'_>],
+    ) -> Result<WgpuTexProgram, WgpuError> {
+        let program = custom::CustomProgram::compile(self, source.as_ref(), additional_uniforms)?;
+        program.pipeline(self, ::wgpu::TextureFormat::Bgra8Unorm, true)?;
+        Ok(WgpuTexProgram(program))
+    }
+
+    /// Compiles a custom WGSL pixel shader.
+    ///
+    /// The shader interface and uniform packing match
+    /// [`compile_custom_texture_shader`](Self::compile_custom_texture_shader), but the
+    /// fragment shader does not need to sample group 0.
+    pub fn compile_custom_pixel_shader(
+        &mut self,
+        source: impl AsRef<str>,
+        additional_uniforms: &[UniformName<'_>],
+    ) -> Result<WgpuPixelProgram, WgpuError> {
+        let program = custom::CustomProgram::compile(self, source.as_ref(), additional_uniforms)?;
+        program.pipeline(self, ::wgpu::TextureFormat::Bgra8Unorm, true)?;
+        Ok(WgpuPixelProgram(program))
+    }
+
+    /// Wraps a same-device WGPU texture as a render target.
+    pub fn bind_wgpu_texture(&mut self, texture: ::wgpu::Texture) -> Result<WgpuTarget<'static>, WgpuError> {
+        if texture.dimension() != ::wgpu::TextureDimension::D2
+            || texture.depth_or_array_layers() != 1
+            || texture.mip_level_count() != 1
+            || texture.sample_count() != 1
+            || !texture.usage().contains(::wgpu::TextureUsages::RENDER_ATTACHMENT)
+            || texture.width() == 0
+            || texture.height() == 0
+            || texture.width() > i32::MAX as u32
+            || texture.height() > i32::MAX as u32
+        {
+            return Err(WgpuError::UnsupportedTextureUsage);
+        }
+        let wgpu_format = texture.format();
+        let format = match wgpu_format {
+            ::wgpu::TextureFormat::Bgra8Unorm | ::wgpu::TextureFormat::Rgba8Unorm => {
+                texture::wgpu_to_format(wgpu_format)?
+            }
+            _ => return Err(WgpuError::UnsupportedWgpuFormat(wgpu_format)),
+        };
+        let size = Size::from((texture.width() as i32, texture.height() as i32));
+        Ok(WgpuTarget {
+            texture: WgpuTexture::from_raw(
+                texture,
+                size,
+                format,
+                wgpu_format,
+                false,
+                self.context_id.clone(),
+                None,
+            ),
+            buffer: PhantomData,
+        })
+    }
+
+    fn push_uniform_data(&mut self, data: &[f32; custom::UNIFORM_SLOTS * 4]) -> Result<u32, WgpuError> {
+        let offset = self.uniform_data.len();
+        if offset > u32::MAX as usize {
+            return Err(WgpuError::Unsupported);
+        }
+        let end = offset
+            .checked_add(self.uniform_stride)
+            .ok_or(WgpuError::InvalidRegion)?;
+        if end as u64 > self.device.limits().max_buffer_size {
+            return Err(WgpuError::InvalidRegion);
+        }
+        self.uniform_data.resize(end, 0);
+        // f32 has no invalid bit patterns and the destination covers exactly the fixed payload.
+        let bytes =
+            unsafe { std::slice::from_raw_parts(data.as_ptr().cast::<u8>(), custom::UNIFORM_SIZE as usize) };
+        self.uniform_data[offset..offset + custom::UNIFORM_SIZE as usize].copy_from_slice(bytes);
+        Ok(offset as u32)
+    }
+
+    fn ensure_uniform_capacity(&mut self, len: usize) -> Result<(), WgpuError> {
+        if len <= self.uniform_capacity {
+            return Ok(());
+        }
+        let capacity = len.checked_next_power_of_two().ok_or(WgpuError::InvalidRegion)?;
+        if capacity as u64 > self.device.limits().max_buffer_size {
+            return Err(WgpuError::InvalidRegion);
+        }
+        self.uniform_buffer = self.device.create_buffer(&::wgpu::BufferDescriptor {
+            label: Some("Smithay WGPU custom uniform buffer"),
+            size: capacity as u64,
+            usage: ::wgpu::BufferUsages::UNIFORM | ::wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.uniform_bind_group =
+            create_uniform_bind_group(&self.device, &self.uniform_layout, &self.uniform_buffer);
+        self.uniform_capacity = capacity;
+        Ok(())
     }
 
     fn create_pipeline(
@@ -288,32 +555,7 @@ impl WgpuRenderer {
                     module: &self.shader,
                     entry_point: Some("vertex"),
                     compilation_options: Default::default(),
-                    buffers: &[Some(::wgpu::VertexBufferLayout {
-                        array_stride: mem::size_of::<Vertex>() as u64,
-                        step_mode: ::wgpu::VertexStepMode::Vertex,
-                        attributes: &[
-                            ::wgpu::VertexAttribute {
-                                format: ::wgpu::VertexFormat::Float32x2,
-                                offset: 0,
-                                shader_location: 0,
-                            },
-                            ::wgpu::VertexAttribute {
-                                format: ::wgpu::VertexFormat::Float32x2,
-                                offset: 8,
-                                shader_location: 1,
-                            },
-                            ::wgpu::VertexAttribute {
-                                format: ::wgpu::VertexFormat::Float32x4,
-                                offset: 16,
-                                shader_location: 2,
-                            },
-                            ::wgpu::VertexAttribute {
-                                format: ::wgpu::VertexFormat::Float32,
-                                offset: 32,
-                                shader_location: 3,
-                            },
-                        ],
-                    })],
+                    buffers: &[Some(vertex_buffer_layout())],
                 },
                 primitive: ::wgpu::PrimitiveState::default(),
                 depth_stencil: None,
@@ -338,11 +580,24 @@ impl WgpuRenderer {
             return;
         }
         let premultiplied = ::wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING;
+        let multiply = ::wgpu::BlendState {
+            color: ::wgpu::BlendComponent {
+                src_factor: ::wgpu::BlendFactor::Zero,
+                dst_factor: ::wgpu::BlendFactor::Src,
+                operation: ::wgpu::BlendOperation::Add,
+            },
+            alpha: ::wgpu::BlendComponent {
+                src_factor: ::wgpu::BlendFactor::Zero,
+                dst_factor: ::wgpu::BlendFactor::One,
+                operation: ::wgpu::BlendOperation::Add,
+            },
+        };
         self.pipelines.insert(
             format,
             Pipelines {
                 replace: self.create_pipeline(format, "solid_fragment", None, false),
                 solid: self.create_pipeline(format, "solid_fragment", Some(premultiplied), false),
+                solid_multiply: self.create_pipeline(format, "solid_fragment", Some(multiply), false),
                 texture: self.create_pipeline(format, "texture_fragment", Some(premultiplied), true),
                 texture_opaque: self.create_pipeline(format, "texture_fragment", None, true),
             },
@@ -379,7 +634,7 @@ impl WgpuRenderer {
     ) -> Result<SyncPoint, WgpuError> {
         let mut used = vec![target];
         for texture in draws.iter().filter_map(|draw| match &draw.kind {
-            DrawKind::Texture { texture, .. } => Some(texture),
+            DrawKind::Texture { texture, .. } | DrawKind::CustomTexture { texture, .. } => Some(texture),
             _ => None,
         }) {
             if !used.iter().any(|used| std::ptr::eq(used.raw(), texture.raw())) {
@@ -394,6 +649,31 @@ impl WgpuRenderer {
             };
             self.queue.write_buffer(&self.vertex_buffer, 0, bytes);
         }
+        if !self.uniform_data.is_empty() {
+            self.ensure_uniform_capacity(self.uniform_data.len())?;
+            self.queue
+                .write_buffer(&self.uniform_buffer, 0, &self.uniform_data);
+        }
+        let mut custom_pipelines = mem::take(&mut self.prepared_pipelines);
+        custom_pipelines.clear();
+        for draw in draws {
+            let pipeline = match &draw.kind {
+                DrawKind::CustomTexture { program, blend, .. } => {
+                    program.0.pipeline(self, target.wgpu_format(), *blend).map(Some)
+                }
+                DrawKind::CustomPixel { program, blend, .. } => {
+                    program.0.pipeline(self, target.wgpu_format(), *blend).map(Some)
+                }
+                _ => Ok(None),
+            };
+            match pipeline {
+                Ok(pipeline) => custom_pipelines.push(pipeline),
+                Err(error) => {
+                    self.prepared_pipelines = custom_pipelines;
+                    return Err(error);
+                }
+            }
+        }
         let mut encoder = self
             .device
             .create_command_encoder(&::wgpu::CommandEncoderDescriptor {
@@ -405,28 +685,15 @@ impl WgpuRenderer {
             TextureFilter::Linear => 1,
         };
         let sampler = &self.samplers[index(self.min_filter)][index(self.mag_filter)];
-        let bind_groups: Vec<_> = draws
-            .iter()
-            .map(|draw| match &draw.kind {
-                DrawKind::Texture { texture, .. } => {
-                    Some(self.device.create_bind_group(&::wgpu::BindGroupDescriptor {
-                        label: Some("Smithay WGPU texture bind group"),
-                        layout: &self.texture_layout,
-                        entries: &[
-                            ::wgpu::BindGroupEntry {
-                                binding: 0,
-                                resource: ::wgpu::BindingResource::TextureView(texture.view()),
-                            },
-                            ::wgpu::BindGroupEntry {
-                                binding: 1,
-                                resource: ::wgpu::BindingResource::Sampler(sampler),
-                            },
-                        ],
-                    }))
-                }
-                _ => None,
-            })
-            .collect();
+        let sampler_index = index(self.min_filter) * 2 + index(self.mag_filter);
+        let mut bind_groups = mem::take(&mut self.prepared_bind_groups);
+        bind_groups.clear();
+        bind_groups.extend(draws.iter().map(|draw| match &draw.kind {
+            DrawKind::Texture { texture, .. } | DrawKind::CustomTexture { texture, .. } => {
+                Some(texture.bind_group(sampler_index, &self.device, &self.texture_layout, sampler))
+            }
+            _ => None,
+        }));
         {
             let mut pass = encoder.begin_render_pass(&::wgpu::RenderPassDescriptor {
                 label: Some("Smithay WGPU render pass"),
@@ -447,10 +714,12 @@ impl WgpuRenderer {
             pass.set_viewport(0.0, 0.0, viewport.w as f32, viewport.h as f32, 0.0, 1.0);
             pass.set_scissor_rect(0, 0, viewport.w as u32, viewport.h as u32);
             pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-            for (draw, bind_group) in draws.iter().zip(&bind_groups) {
+            for ((draw, bind_group), custom_pipeline) in draws.iter().zip(&bind_groups).zip(&custom_pipelines)
+            {
                 match &draw.kind {
                     DrawKind::Replace => pass.set_pipeline(&pipelines.replace),
                     DrawKind::Solid => pass.set_pipeline(&pipelines.solid),
+                    DrawKind::SolidMultiply => pass.set_pipeline(&pipelines.solid_multiply),
                     DrawKind::Texture { opaque, .. } => {
                         pass.set_pipeline(if *opaque {
                             &pipelines.texture_opaque
@@ -461,10 +730,28 @@ impl WgpuRenderer {
                         pass.draw(draw.vertices.clone(), 0..1);
                         continue;
                     }
+                    DrawKind::CustomTexture { uniform_offset, .. } => {
+                        pass.set_pipeline(custom_pipeline.as_ref().unwrap());
+                        pass.set_bind_group(0, bind_group.as_ref().unwrap(), &[]);
+                        pass.set_bind_group(1, &self.uniform_bind_group, &[*uniform_offset]);
+                        pass.draw(draw.vertices.clone(), 0..1);
+                        continue;
+                    }
+                    DrawKind::CustomPixel { uniform_offset, .. } => {
+                        pass.set_pipeline(custom_pipeline.as_ref().unwrap());
+                        pass.set_bind_group(0, &self.dummy_bind_groups[sampler_index], &[]);
+                        pass.set_bind_group(1, &self.uniform_bind_group, &[*uniform_offset]);
+                        pass.draw(draw.vertices.clone(), 0..1);
+                        continue;
+                    }
                 }
                 pass.draw(draw.vertices.clone(), 0..1);
             }
         }
+        custom_pipelines.clear();
+        bind_groups.clear();
+        self.prepared_pipelines = custom_pipelines;
+        self.prepared_bind_groups = bind_groups;
 
         let resting = used.iter().filter_map(|texture| {
             let state = texture.sync()?.resting_state()?;
@@ -557,7 +844,14 @@ impl WgpuRenderer {
         if !texture.raw().usage().contains(::wgpu::TextureUsages::COPY_SRC) {
             return Err(WgpuError::UnsupportedTextureUsage);
         }
-        if format != texture.format().unwrap() {
+        let source_format = texture.format().unwrap();
+        let eight_bit = |format| {
+            matches!(
+                format,
+                DrmFourcc::Argb8888 | DrmFourcc::Xrgb8888 | DrmFourcc::Abgr8888 | DrmFourcc::Xbgr8888
+            )
+        };
+        if format != source_format && (!eight_bit(format) || !eight_bit(source_format)) {
             return Err(WgpuError::UnsupportedPixelFormat(format));
         }
         let right = region
@@ -654,6 +948,18 @@ impl WgpuRenderer {
         }
         drop(mapped);
         buffer.unmap();
+        if eight_bit(source_format) && eight_bit(format) {
+            let source_wgpu = texture::format_to_wgpu(source_format)?;
+            let target_wgpu = texture::format_to_wgpu(format)?;
+            for pixel in data.chunks_exact_mut(4) {
+                if source_wgpu != target_wgpu {
+                    pixel.swap(0, 2);
+                }
+                if !texture::has_alpha(source_format) || !texture::has_alpha(format) {
+                    pixel[3] = u8::MAX;
+                }
+            }
+        }
         Ok(WgpuMapping {
             data,
             size: region.size,
@@ -665,18 +971,18 @@ impl WgpuRenderer {
 impl RendererSuper for WgpuRenderer {
     type Error = WgpuError;
     type TextureId = WgpuTexture;
-    type Framebuffer<'buffer> = WgpuTarget;
+    type Framebuffer<'buffer> = WgpuTarget<'buffer>;
     type Frame<'frame, 'buffer>
-        = WgpuFrame<'frame>
+        = WgpuFrame<'frame, 'buffer>
     where
         'buffer: 'frame;
 }
 
 /// In-progress WGPU frame.
 #[derive(Debug)]
-pub struct WgpuFrame<'frame> {
+pub struct WgpuFrame<'frame, 'buffer> {
     renderer: &'frame mut WgpuRenderer,
-    target: WgpuTexture,
+    target: &'frame mut WgpuTarget<'buffer>,
     output_size: Size<i32, Physical>,
     transform: Transform,
     vertices: Vec<Vertex>,
@@ -708,10 +1014,10 @@ impl Renderer for WgpuRenderer {
 
     fn render<'frame, 'buffer>(
         &'frame mut self,
-        framebuffer: &'frame mut WgpuTarget,
+        framebuffer: &'frame mut WgpuTarget<'buffer>,
         output_size: Size<i32, Physical>,
         dst_transform: Transform,
-    ) -> Result<WgpuFrame<'frame>, WgpuError>
+    ) -> Result<WgpuFrame<'frame, 'buffer>, WgpuError>
     where
         'buffer: 'frame,
     {
@@ -727,7 +1033,7 @@ impl Renderer for WgpuRenderer {
         }
         self.ensure_pipelines(framebuffer.texture.wgpu_format());
         Ok(WgpuFrame {
-            target: framebuffer.texture.clone(),
+            target: framebuffer,
             output_size,
             transform: dst_transform,
             vertices: mem::take(&mut self.vertices),
@@ -742,7 +1048,7 @@ impl Renderer for WgpuRenderer {
 }
 
 impl Bind<WgpuTexture> for WgpuRenderer {
-    fn bind(&mut self, target: &mut WgpuTexture) -> Result<WgpuTarget, WgpuError> {
+    fn bind<'a>(&mut self, target: &'a mut WgpuTexture) -> Result<WgpuTarget<'a>, WgpuError> {
         if target.context_id() != &self.context_id {
             return Err(WgpuError::ForeignTexture);
         }
@@ -755,6 +1061,7 @@ impl Bind<WgpuTexture> for WgpuRenderer {
         }
         Ok(WgpuTarget {
             texture: target.clone(),
+            buffer: PhantomData,
         })
     }
 
@@ -774,7 +1081,7 @@ impl Bind<WgpuTexture> for WgpuRenderer {
 
 #[cfg(unix)]
 impl Bind<Dmabuf> for WgpuRenderer {
-    fn bind(&mut self, target: &mut Dmabuf) -> Result<WgpuTarget, WgpuError> {
+    fn bind<'a>(&mut self, target: &'a mut Dmabuf) -> Result<WgpuTarget<'a>, WgpuError> {
         let interop = self
             .vulkan
             .as_ref()
@@ -795,7 +1102,10 @@ impl Bind<Dmabuf> for WgpuRenderer {
             self.context_id.clone(),
             Some(imported.sync),
         );
-        Ok(WgpuTarget { texture })
+        Ok(WgpuTarget {
+            texture,
+            buffer: PhantomData,
+        })
     }
 
     fn supported_formats(&self) -> Option<FormatSet> {
@@ -1062,7 +1372,7 @@ impl ExportMem for WgpuRenderer {
 
     fn copy_framebuffer(
         &mut self,
-        target: &WgpuTarget,
+        target: &WgpuTarget<'_>,
         region: Rectangle<i32, Buffer>,
         format: DrmFourcc,
     ) -> Result<WgpuMapping, WgpuError> {
@@ -1091,8 +1401,8 @@ impl ExportMem for WgpuRenderer {
 impl Blit for WgpuRenderer {
     fn blit(
         &mut self,
-        from: &WgpuTarget,
-        to: &mut WgpuTarget,
+        from: &WgpuTarget<'_>,
+        to: &mut WgpuTarget<'_>,
         src: Rectangle<i32, Physical>,
         dst: Rectangle<i32, Physical>,
         filter: TextureFilter,
@@ -1116,6 +1426,9 @@ impl Blit for WgpuRenderer {
                 Transform::Normal,
                 1.0,
                 true,
+                None,
+                &[],
+                false,
             )?;
             frame.finish()
         })();

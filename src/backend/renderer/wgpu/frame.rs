@@ -2,13 +2,16 @@ use std::{mem, ops::Range};
 
 use glam::{Affine2, Vec2};
 
-use super::{Draw, DrawKind, Vertex, WgpuError, WgpuFrame, WgpuTarget, WgpuTexture, texture::has_alpha};
+use super::{
+    Draw, DrawKind, Uniform, Vertex, WgpuError, WgpuFrame, WgpuPixelProgram, WgpuTarget, WgpuTexProgram,
+    WgpuTexture, texture::has_alpha,
+};
 use crate::{
     backend::renderer::{Blit, BlitFrame, Color32F, ContextId, DebugFlags, Frame, Texture, TextureFilter},
     utils::{Buffer, Physical, Point, Rectangle, Size, Transform},
 };
 
-impl WgpuFrame<'_> {
+impl WgpuFrame<'_, '_> {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn render_texture(
         &mut self,
@@ -19,11 +22,14 @@ impl WgpuFrame<'_> {
         src_transform: Transform,
         alpha: f32,
         blit: bool,
+        program: Option<&WgpuTexProgram>,
+        additional_uniforms: &[Uniform<'_>],
+        blend: bool,
     ) -> Result<(), WgpuError> {
         if texture.context_id() != &self.renderer.context_id {
             return Err(WgpuError::ForeignTexture);
         }
-        if texture.same_storage(&self.target) {
+        if texture.same_storage(&self.target.texture) {
             return Err(WgpuError::Unsupported);
         }
         if !texture
@@ -42,13 +48,29 @@ impl WgpuFrame<'_> {
             || !src.loc.y.is_finite()
             || !source_right.is_finite()
             || !source_bottom.is_finite()
-            || src.loc.x < 0.0
-            || src.loc.y < 0.0
-            || source_right > texture.width() as f64
-            || source_bottom > texture.height() as f64
+            || (program.is_none()
+                && (src.loc.x < 0.0
+                    || src.loc.y < 0.0
+                    || source_right > texture.width() as f64
+                    || source_bottom > texture.height() as f64))
         {
             return Err(WgpuError::InvalidRegion);
         }
+
+        if let Some(program) = program {
+            program.0.check_context(self.renderer)?;
+        }
+        let custom_uniforms = program
+            .map(|program| {
+                let target_size = self.transform.transform_size(self.output_size);
+                program.0.uniform_data(
+                    [target_size.w as f32, target_size.h as f32],
+                    alpha,
+                    self.renderer.debug_flags.contains(DebugFlags::TINT),
+                    additional_uniforms,
+                )
+            })
+            .transpose()?;
 
         let texture_size = texture.size();
         let transformed_src_size = src_transform.transform_size(src.size);
@@ -80,8 +102,8 @@ impl WgpuFrame<'_> {
         )) * texture_matrix;
 
         let start = self.vertices.len() as u32;
-        let mut tint = [alpha; 4];
-        if !blit && self.renderer.debug_flags.contains(DebugFlags::TINT) {
+        let mut tint = if program.is_some() { [1.0; 4] } else { [alpha; 4] };
+        if program.is_none() && !blit && self.renderer.debug_flags.contains(DebugFlags::TINT) {
             tint[1] *= 0.5;
             tint[2] *= 0.5;
         }
@@ -115,12 +137,227 @@ impl WgpuFrame<'_> {
         }
         let end = self.vertices.len() as u32;
         if start != end {
-            self.draws.push(Draw {
-                vertices: start..end,
-                kind: DrawKind::Texture {
+            let kind = if let Some(program) = program {
+                let uniform_offset = match self.renderer.push_uniform_data(custom_uniforms.as_ref().unwrap())
+                {
+                    Ok(offset) => offset,
+                    Err(error) => {
+                        self.vertices.truncate(start as usize);
+                        return Err(error);
+                    }
+                };
+                DrawKind::CustomTexture {
+                    texture: texture.clone(),
+                    program: program.clone(),
+                    blend,
+                    uniform_offset,
+                }
+            } else {
+                DrawKind::Texture {
                     texture: texture.clone(),
                     opaque: blit || (!has_alpha(texture.format().unwrap()) && alpha == 1.0),
+                }
+            };
+            self.draws.push(Draw {
+                vertices: start..end,
+                kind,
+            });
+        }
+        Ok(())
+    }
+
+    /// Renders a texture, optionally using a custom WGSL program.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_texture_from_to(
+        &mut self,
+        texture: &WgpuTexture,
+        src: Rectangle<f64, Buffer>,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        opaque_regions: &[Rectangle<i32, Physical>],
+        src_transform: Transform,
+        alpha: f32,
+        program: Option<&WgpuTexProgram>,
+        additional_uniforms: &[Uniform<'_>],
+    ) -> Result<(), WgpuError> {
+        let Some(program) = program else {
+            return self.render_texture(
+                texture,
+                src,
+                dst,
+                damage,
+                src_transform,
+                alpha,
+                false,
+                None,
+                &[],
+                true,
+            );
+        };
+        if alpha != 1.0 || opaque_regions.is_empty() {
+            return self.render_texture(
+                texture,
+                src,
+                dst,
+                damage,
+                src_transform,
+                alpha,
+                false,
+                Some(program),
+                additional_uniforms,
+                true,
+            );
+        }
+
+        let mut non_opaque = mem::take(&mut self.renderer.non_opaque_damage);
+        let mut opaque = mem::take(&mut self.renderer.opaque_damage);
+        non_opaque.clear();
+        opaque.clear();
+        non_opaque.extend_from_slice(damage);
+        opaque.extend_from_slice(damage);
+        non_opaque = Rectangle::subtract_rects_many_in_place(non_opaque, opaque_regions.iter().copied());
+        opaque = Rectangle::subtract_rects_many_in_place(opaque, non_opaque.iter().copied());
+        let non_opaque_result = self.render_texture(
+            texture,
+            src,
+            dst,
+            &non_opaque,
+            src_transform,
+            alpha,
+            false,
+            Some(program),
+            additional_uniforms,
+            true,
+        );
+        let opaque_result = self.render_texture(
+            texture,
+            src,
+            dst,
+            &opaque,
+            src_transform,
+            alpha,
+            false,
+            Some(program),
+            additional_uniforms,
+            false,
+        );
+        self.renderer.non_opaque_damage = non_opaque;
+        self.renderer.opaque_damage = opaque;
+        non_opaque_result?;
+        opaque_result
+    }
+
+    /// Renders a custom WGSL pixel shader into a destination rectangle.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_pixel_shader_to(
+        &mut self,
+        pixel_shader: &WgpuPixelProgram,
+        src: Rectangle<f64, Buffer>,
+        dst: Rectangle<i32, Physical>,
+        size: Size<i32, Buffer>,
+        damage: Option<&[Rectangle<i32, Physical>]>,
+        alpha: f32,
+        additional_uniforms: &[Uniform<'_>],
+    ) -> Result<(), WgpuError> {
+        pixel_shader.0.check_context(self.renderer)?;
+        let source_right = src.loc.x + src.size.w;
+        let source_bottom = src.loc.y + src.size.h;
+        if src.size.is_empty() || dst.size.is_empty() {
+            return Ok(());
+        }
+        if size.is_empty()
+            || !src.loc.x.is_finite()
+            || !src.loc.y.is_finite()
+            || !source_right.is_finite()
+            || !source_bottom.is_finite()
+        {
+            return Err(WgpuError::InvalidRegion);
+        }
+        let uniform_data = pixel_shader.0.uniform_data(
+            [size.w as f32, size.h as f32],
+            alpha,
+            self.renderer.debug_flags.contains(DebugFlags::TINT),
+            additional_uniforms,
+        )?;
+
+        let scale = src.size.to_f64() / dst.size.to_f64();
+        let texture_matrix = Affine2::from_scale(Vec2::new(
+            scale.x as f32 / size.w as f32,
+            scale.y as f32 / size.h as f32,
+        ));
+        let texture_matrix = Affine2::from_translation(Vec2::new(
+            src.loc.x as f32 / size.w as f32,
+            src.loc.y as f32 / size.h as f32,
+        )) * texture_matrix;
+
+        let fallback_damage = [Rectangle::from_size(dst.size)];
+        let damage = damage.unwrap_or(&fallback_damage);
+        let start = self.vertices.len() as u32;
+        for damage in damage {
+            let Some((local_rect, rect)) = Self::damage_rect(dst, *damage)? else {
+                continue;
+            };
+            let x0 = local_rect.loc.x as f32;
+            let y0 = local_rect.loc.y as f32;
+            let x1 = local_rect
+                .loc
+                .x
+                .checked_add(local_rect.size.w)
+                .ok_or(WgpuError::InvalidRegion)? as f32;
+            let y1 = local_rect
+                .loc
+                .y
+                .checked_add(local_rect.size.h)
+                .ok_or(WgpuError::InvalidRegion)? as f32;
+            let coords = [
+                texture_matrix.transform_point2(Vec2::new(x0, y0)).to_array(),
+                texture_matrix.transform_point2(Vec2::new(x1, y0)).to_array(),
+                texture_matrix.transform_point2(Vec2::new(x0, y1)).to_array(),
+                texture_matrix.transform_point2(Vec2::new(x1, y1)).to_array(),
+            ];
+            self.push_quad(rect, coords, [1.0; 4], false)?;
+        }
+        let end = self.vertices.len() as u32;
+        if start != end {
+            let uniform_offset = match self.renderer.push_uniform_data(&uniform_data) {
+                Ok(offset) => offset,
+                Err(error) => {
+                    self.vertices.truncate(start as usize);
+                    return Err(error);
+                }
+            };
+            self.draws.push(Draw {
+                vertices: start..end,
+                kind: DrawKind::CustomPixel {
+                    program: pixel_shader.clone(),
+                    blend: true,
+                    uniform_offset,
                 },
+            });
+        }
+        Ok(())
+    }
+
+    /// Multiplies destination RGB by `color` while preserving destination alpha.
+    pub fn draw_solid_multiply(
+        &mut self,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        color: Color32F,
+    ) -> Result<(), WgpuError> {
+        let start = self.vertices.len() as u32;
+        for damage in damage {
+            let Some((_, rect)) = Self::damage_rect(dst, *damage)? else {
+                continue;
+            };
+            let [red, green, blue, _] = color.components();
+            self.push_quad(rect, [[0.0; 2]; 4], [red, green, blue, 1.0], true)?;
+        }
+        let end = self.vertices.len() as u32;
+        if start != end {
+            self.draws.push(Draw {
+                vertices: start..end,
+                kind: DrawKind::SolidMultiply,
             });
         }
         Ok(())
@@ -227,13 +464,14 @@ impl WgpuFrame<'_> {
 
     fn flush(&mut self) -> Result<crate::backend::renderer::sync::SyncPoint, WgpuError> {
         let result = self.renderer.submit(
-            &self.target,
+            &self.target.texture,
             self.transform.transform_size(self.output_size),
             &self.vertices,
             &self.draws,
         );
         self.vertices.clear();
         self.draws.clear();
+        self.renderer.uniform_data.clear();
         result
     }
 
@@ -247,7 +485,7 @@ impl WgpuFrame<'_> {
     }
 }
 
-impl Frame for WgpuFrame<'_> {
+impl Frame for WgpuFrame<'_, '_> {
     type Error = WgpuError;
     type TextureId = WgpuTexture;
 
@@ -278,7 +516,18 @@ impl Frame for WgpuFrame<'_> {
         src_transform: Transform,
         alpha: f32,
     ) -> Result<(), Self::Error> {
-        self.render_texture(texture, src, dst, damage, src_transform, alpha, false)
+        self.render_texture(
+            texture,
+            src,
+            dst,
+            damage,
+            src_transform,
+            alpha,
+            false,
+            None,
+            &[],
+            true,
+        )
     }
 
     fn transformation(&self) -> Transform {
@@ -298,31 +547,33 @@ impl Frame for WgpuFrame<'_> {
     }
 }
 
-impl BlitFrame<WgpuTarget> for WgpuFrame<'_> {
+impl BlitFrame<WgpuTarget<'_>> for WgpuFrame<'_, '_> {
     fn blit_to(
         &mut self,
-        to: &mut WgpuTarget,
+        to: &mut WgpuTarget<'_>,
         src: Rectangle<i32, Physical>,
         dst: Rectangle<i32, Physical>,
         filter: TextureFilter,
     ) -> Result<crate::backend::renderer::sync::SyncPoint, WgpuError> {
         let _ = self.flush()?;
         let from = WgpuTarget {
-            texture: self.target.clone(),
+            texture: self.target.texture.clone(),
+            buffer: std::marker::PhantomData,
         };
         self.renderer.blit(&from, to, src, dst, filter)
     }
 
     fn blit_from(
         &mut self,
-        from: &WgpuTarget,
+        from: &WgpuTarget<'_>,
         src: Rectangle<i32, Physical>,
         dst: Rectangle<i32, Physical>,
         filter: TextureFilter,
     ) -> Result<crate::backend::renderer::sync::SyncPoint, WgpuError> {
         let _ = self.flush()?;
         let mut to = WgpuTarget {
-            texture: self.target.clone(),
+            texture: self.target.texture.clone(),
+            buffer: std::marker::PhantomData,
         };
         self.renderer.blit(from, &mut to, src, dst, filter)
     }

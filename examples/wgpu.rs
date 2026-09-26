@@ -48,6 +48,7 @@ fn main() {
         info.name, info.device_type, info.backend
     );
 
+    test_custom_pixel_first_draw(&mut renderer);
     test_clear_and_damage(&mut renderer);
     test_memory_import_and_update(&mut renderer);
     test_texture_transforms(&mut renderer);
@@ -60,7 +61,9 @@ fn main() {
     test_blits(&mut renderer);
     test_invalid_bounds(&mut renderer);
 
-    println!("Passed: clear, damage, viewport, memory, transforms, alpha, crop, filtering, blits, bounds");
+    println!(
+        "Passed: custom pixel, clear, damage, viewport, memory, transforms, alpha, crop, filtering, blits, bounds"
+    );
 }
 
 fn target(renderer: &mut WgpuRenderer, size: (i32, i32)) -> WgpuTexture {
@@ -70,13 +73,10 @@ fn target(renderer: &mut WgpuRenderer, size: (i32, i32)) -> WgpuTexture {
 
 macro_rules! render {
     ($renderer:expr, $target:expr, $transform:expr, |$frame:ident| $body:block) => {{
+        let __size = Size::<i32, Physical>::from(($target.width() as i32, $target.height() as i32));
         let mut framebuffer = $renderer.bind($target).expect("Failed to bind target");
         let mut __frame = $renderer
-            .render(
-                &mut framebuffer,
-                Size::<i32, Physical>::from(($target.width() as i32, $target.height() as i32)),
-                $transform,
-            )
+            .render(&mut framebuffer, __size, $transform)
             .expect("Failed to begin frame");
         {
             let $frame = &mut __frame;
@@ -85,6 +85,45 @@ macro_rules! render {
         let sync = __frame.finish().expect("Failed to finish frame");
         $renderer.wait(&sync).expect("Failed to wait for frame");
     }};
+}
+
+fn test_custom_pixel_first_draw(renderer: &mut WgpuRenderer) {
+    let program = renderer
+        .compile_custom_pixel_shader(
+            r#"
+struct CustomUniforms {
+    values: array<vec4<f32>, 32>,
+};
+
+@group(1) @binding(0)
+var<uniform> custom: CustomUniforms;
+
+@fragment
+fn custom_fragment(_input: VertexOutput) -> @location(0) vec4<f32> {
+    return vec4<f32>(custom.values[0].z, 0.0, 0.0, custom.values[0].z);
+}
+"#,
+            &[],
+        )
+        .expect("Failed to compile custom pixel shader");
+    let size = Size::<i32, Buffer>::from((2, 2));
+    let mut texture = target(renderer, (size.w, size.h));
+    render!(renderer, &mut texture, Transform::Normal, |frame| {
+        frame
+            .render_pixel_shader_to(
+                &program,
+                Rectangle::from_size(size).to_f64(),
+                physical_rect((size.w, size.h)),
+                size,
+                None,
+                1.0,
+                &[],
+            )
+            .expect("Failed to render custom pixel shader as the first draw");
+    });
+    for pixel in read(renderer, &texture).chunks_exact(4) {
+        assert_eq!(pixel, [255, 0, 0, 255]);
+    }
 }
 
 fn read(renderer: &mut WgpuRenderer, texture: &WgpuTexture) -> Vec<u8> {
@@ -185,6 +224,8 @@ fn test_texture_transforms(renderer: &mut WgpuRenderer) {
                     &[],
                     transform,
                     1.0,
+                    None,
+                    &[],
                 )
                 .expect("Failed to render transformed texture");
         });
@@ -308,6 +349,8 @@ fn test_non_square_transforms(renderer: &mut WgpuRenderer) {
                     &[],
                     transform,
                     1.0,
+                    None,
+                    &[],
                 )
                 .expect("Failed to render non-square transform");
         });
@@ -367,6 +410,8 @@ fn test_destination_damage(renderer: &mut WgpuRenderer) {
                 &[],
                 Transform::Normal,
                 1.0,
+                None,
+                &[],
             )
             .expect("Failed to render damaged texture");
     });
@@ -399,6 +444,8 @@ fn test_alpha_and_crop(renderer: &mut WgpuRenderer) {
                 &[],
                 Transform::Normal,
                 1.0,
+                None,
+                &[],
             )
             .expect("Failed to blend alpha fixture");
     });
@@ -420,6 +467,8 @@ fn test_alpha_and_crop(renderer: &mut WgpuRenderer) {
                 &[],
                 Transform::Normal,
                 1.0,
+                None,
+                &[],
             )
             .expect("Failed to render crop");
     });
@@ -453,6 +502,8 @@ fn test_nearest_filter(renderer: &mut WgpuRenderer) {
                 &[],
                 Transform::Normal,
                 1.0,
+                None,
+                &[],
             )
             .expect("Failed to scale nearest fixture");
     });
@@ -488,6 +539,8 @@ fn test_nearest_filter(renderer: &mut WgpuRenderer) {
                 &[],
                 Transform::Normal,
                 1.0,
+                None,
+                &[],
             )
             .expect("Failed to minify nearest fixture");
     });
@@ -613,6 +666,8 @@ fn test_blits(renderer: &mut WgpuRenderer) {
                 &[],
                 Transform::Normal,
                 1.0,
+                None,
+                &[],
             )
             .expect("Failed to draw after blit_from");
     });

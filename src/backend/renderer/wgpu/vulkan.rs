@@ -1,11 +1,13 @@
 use std::{
     fmt,
+    os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd},
     sync::{Arc, Mutex},
 };
 
-use ash::{ext, vk};
+use ash::{ext, khr, vk};
 use drm_fourcc::{DrmFormat, DrmFourcc, DrmModifier};
 use rustix::event::{PollFd, PollFlags};
+use rustix::ioctl::{Setter, Updater};
 use thiserror::Error;
 use wgpu::hal::{self, api::Vulkan};
 
@@ -68,9 +70,18 @@ pub enum VulkanError {
     /// The requested limits exceed the adapter's capabilities.
     #[error("Requested device limits exceed the adapter's capabilities")]
     UnsupportedLimits,
-    /// Waiting for implicit DMA-BUF synchronization failed.
-    #[error("Waiting for DMA-BUF synchronization failed: {0}")]
-    DmabufWait(#[source] std::io::Error),
+    /// Exchanging or waiting for implicit DMA-BUF synchronization failed.
+    #[error("DMA-BUF synchronization failed: {0}")]
+    DmabufSync(#[source] std::io::Error),
+    /// Creating a Vulkan semaphore failed.
+    #[error("Creating a Vulkan semaphore failed: {0}")]
+    CreateSemaphore(#[source] vk::Result),
+    /// Importing a native fence into Vulkan failed.
+    #[error("Importing a native fence into Vulkan failed: {0}")]
+    ImportSemaphore(#[source] vk::Result),
+    /// Exporting a native fence from Vulkan failed.
+    #[error("Exporting a native fence from Vulkan failed: {0}")]
+    ExportSemaphore(#[source] vk::Result),
     /// Waiting for WGPU work failed.
     #[error("Waiting for WGPU work failed: {0}")]
     WgpuWait(#[source] wgpu::PollError),
@@ -79,8 +90,9 @@ pub enum VulkanError {
 /// Request a WGPU Vulkan device capable of importing DMA-BUFs.
 ///
 /// In addition to WGPU's external-memory feature this enables
-/// `VK_EXT_queue_family_foreign`, which is needed to preserve the contents of
-/// images exchanged with non-Vulkan APIs.
+/// `VK_EXT_queue_family_foreign`, which preserves image contents across API
+/// ownership transfers, and `VK_KHR_external_semaphore_fd`, which exchanges
+/// native fences with implicit DMA-BUF synchronization.
 pub fn request_device(
     adapter: &wgpu::Adapter,
     descriptor: &wgpu::DeviceDescriptor<'_>,
@@ -113,6 +125,20 @@ pub fn request_device(
     {
         return Err(VulkanError::MissingExtension("VK_EXT_queue_family_foreign"));
     }
+    if !adapter_guard
+        .physical_device_capabilities()
+        .supports_extension(khr::external_semaphore_fd::NAME)
+    {
+        return Err(VulkanError::MissingExtension("VK_KHR_external_semaphore_fd"));
+    }
+    if !supports_sync_file(
+        adapter_guard.shared_instance().raw_instance(),
+        adapter_guard.raw_physical_device(),
+    ) {
+        return Err(VulkanError::MissingExtension(
+            "VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT",
+        ));
+    }
 
     // SAFETY: WGPU validates the feature/limit set above. The callback only
     // adds an extension advertised by this physical device.
@@ -124,6 +150,9 @@ pub fn request_device(
             Some(Box::new(|args| {
                 if !args.extensions.contains(&ext::queue_family_foreign::NAME) {
                     args.extensions.push(ext::queue_family_foreign::NAME);
+                }
+                if !args.extensions.contains(&khr::external_semaphore_fd::NAME) {
+                    args.extensions.push(khr::external_semaphore_fd::NAME);
                 }
             })),
         )
@@ -179,6 +208,20 @@ impl VulkanInterop {
             .contains(&ext::queue_family_foreign::NAME)
         {
             return Err(VulkanError::MissingExtension("VK_EXT_queue_family_foreign"));
+        }
+        if !device_guard
+            .enabled_device_extensions()
+            .contains(&khr::external_semaphore_fd::NAME)
+        {
+            return Err(VulkanError::MissingExtension("VK_KHR_external_semaphore_fd"));
+        }
+        if !supports_sync_file(
+            device_guard.shared_instance().raw_instance(),
+            device_guard.raw_physical_device(),
+        ) {
+            return Err(VulkanError::MissingExtension(
+                "VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT",
+            ));
         }
 
         let mut sampled_formats = Vec::new();
@@ -352,6 +395,7 @@ impl VulkanInterop {
             unsafe { device.create_texture_from_hal::<Vulkan>(hal_texture, &descriptor, RESTING_STATE) };
         let sync = Arc::new(VulkanSync {
             dmabuf: dmabuf.clone(),
+            texture: texture.clone(),
             identity,
             image,
             write: needs_target,
@@ -390,6 +434,7 @@ impl VulkanInterop {
 /// Synchronization state for an imported DMA-BUF.
 pub(crate) struct VulkanSync {
     dmabuf: Dmabuf,
+    texture: wgpu::Texture,
     identity: (u64, u64),
     image: vk::Image,
     write: bool,
@@ -420,8 +465,37 @@ impl VulkanSync {
             return Ok(());
         }
 
-        wait_dmabuf(&self.dmabuf, self.write)?;
-        transfer_ownership(device, queue, self.image, true)?;
+        let command = ownership_transfer(device, self.image, true)?;
+        let semaphore = match export_dmabuf_sync_file(&self.dmabuf, self.write) {
+            Ok(sync_file) => {
+                let (raw, semaphore) = import_sync_file(device, sync_file)?;
+
+                // SAFETY: semaphore belongs to this queue's Vulkan device and
+                // remains alive until the submission which consumes its
+                // temporary payload has completed. An intervening submission
+                // may consume the wait, but the queue's ordering contract still
+                // places the ownership transfer after it.
+                let queue_guard = unsafe { queue.as_hal::<Vulkan>() }.ok_or_else(|| {
+                    // SAFETY: semaphore has not been submitted and has no pending users.
+                    unsafe { raw.destroy_semaphore(semaphore, None) };
+                    VulkanError::NotVulkan
+                })?;
+                queue_guard.add_wait_semaphore(semaphore, None, vk::PipelineStageFlags::ALL_COMMANDS);
+                drop(queue_guard);
+                Some((raw, semaphore))
+            }
+            Err(VulkanError::DmabufSync(err)) if err.raw_os_error() == Some(libc::ENOTTY) => {
+                wait_dmabuf(&self.dmabuf, self.write)?;
+                None
+            }
+            Err(err) => return Err(err),
+        };
+
+        queue.submit([command]);
+        retain_after_submission(queue, self.texture.clone());
+        if let Some((raw, semaphore)) = semaphore {
+            destroy_after_submission(queue, raw, semaphore);
+        }
         *acquired = true;
         Ok(())
     }
@@ -430,22 +504,84 @@ impl VulkanSync {
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        submission: wgpu::SubmissionIndex,
+        _submission: wgpu::SubmissionIndex,
     ) -> Result<(), VulkanError> {
         let mut acquired = self.acquired.lock().unwrap();
         if !*acquired {
             return Ok(());
         }
 
-        device
-            .poll(wgpu::PollType::Wait {
-                submission_index: Some(submission),
-                timeout: None,
-            })
-            .map_err(VulkanError::WgpuWait)?;
-        transfer_ownership(device, queue, self.image, false)?;
+        // WGPU serializes queue submissions. This barrier therefore follows
+        // the renderer submission even when cloned queues are in use.
+        let command = ownership_transfer(device, self.image, false)?;
+        let release_submission = queue.submit([command]);
+        retain_after_submission(queue, self.texture.clone());
         *acquired = false;
+
+        // Signal on a later submission instead of attaching the semaphore to
+        // the release submission. If another thread consumes the staged signal,
+        // that submission is still ordered after the ownership transfer.
+        let sync_file = match export_queue_sync_file(device, queue) {
+            Ok(sync_file) => sync_file,
+            Err(err) => {
+                wait_for_submission(device, &release_submission)?;
+                return Err(err);
+            }
+        };
+        if let Some(sync_file) = sync_file {
+            match import_dmabuf_sync_file(&self.dmabuf, self.write, &sync_file) {
+                Ok(()) => {}
+                Err(VulkanError::DmabufSync(err)) if err.raw_os_error() == Some(libc::ENOTTY) => {
+                    if wait_sync_file(&sync_file).is_err() {
+                        wait_for_submission(device, &release_submission)?;
+                    }
+                }
+                Err(err) => {
+                    if wait_sync_file(&sync_file).is_err() {
+                        wait_for_submission(device, &release_submission)?;
+                    }
+                    return Err(err);
+                }
+            }
+        }
         Ok(())
+    }
+}
+
+/// Returns a native fence covering every WGPU submission queued before this call.
+///
+/// `None` denotes an already-signaled fence, as permitted for Vulkan sync FDs.
+pub(super) fn export_queue_sync_file(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+) -> Result<Option<OwnedFd>, VulkanError> {
+    let (raw, external, semaphore) = create_exportable_semaphore(device)?;
+
+    // SAFETY: semaphore was created by this queue's Vulkan device. A cloned
+    // queue may consume it first, but any such submission is ordered after all
+    // work submitted before this function was entered.
+    let queue_guard = unsafe { queue.as_hal::<Vulkan>() }.ok_or_else(|| {
+        // SAFETY: semaphore has not been submitted and has no pending users.
+        unsafe { raw.destroy_semaphore(semaphore, None) };
+        VulkanError::NotVulkan
+    })?;
+    queue_guard.add_signal_semaphore(semaphore, None);
+    drop(queue_guard);
+
+    queue.submit([]);
+    let get_info = vk::SemaphoreGetFdInfoKHR::default()
+        .semaphore(semaphore)
+        .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
+    // SAFETY: the semaphore was created exportable as SYNC_FD and has a
+    // submitted signal operation pending (or is already signaled).
+    let fd = unsafe { external.get_semaphore_fd(&get_info) };
+    destroy_after_submission(queue, raw, semaphore);
+    let fd = fd.map_err(VulkanError::ExportSemaphore)?;
+    if fd == -1 {
+        Ok(None)
+    } else {
+        // SAFETY: Vulkan returned ownership of this valid file descriptor.
+        Ok(Some(unsafe { OwnedFd::from_raw_fd(fd) }))
     }
 }
 
@@ -544,6 +680,20 @@ fn supports_image(
             .contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE)
 }
 
+fn supports_sync_file(instance: &ash::Instance, physical_device: vk::PhysicalDevice) -> bool {
+    let info = vk::PhysicalDeviceExternalSemaphoreInfo::default()
+        .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
+    let mut properties = vk::ExternalSemaphoreProperties::default();
+    // SAFETY: info and properties remain valid for this read-only capability
+    // query and adapter supplies a live physical-device handle.
+    unsafe {
+        instance.get_physical_device_external_semaphore_properties(physical_device, &info, &mut properties)
+    };
+    properties.external_semaphore_features.contains(
+        vk::ExternalSemaphoreFeatureFlags::IMPORTABLE | vk::ExternalSemaphoreFeatureFlags::EXPORTABLE,
+    )
+}
+
 #[cfg(feature = "backend_drm")]
 fn physical_device_nodes(device: &hal::vulkan::Device) -> [Option<libc::dev_t>; 2] {
     let mut drm_properties = vk::PhysicalDeviceDrmPropertiesEXT::default();
@@ -568,37 +718,11 @@ fn physical_device_nodes(device: &hal::vulkan::Device) -> [Option<libc::dev_t>; 
     ]
 }
 
-fn wait_dmabuf(dmabuf: &Dmabuf, write: bool) -> Result<(), VulkanError> {
-    let events = if write { PollFlags::OUT } else { PollFlags::IN };
-    for handle in dmabuf.handles() {
-        loop {
-            let mut poll_fd = [PollFd::new(&handle, events)];
-            match rustix::event::poll(&mut poll_fd, None) {
-                Ok(_) => {
-                    let ready = poll_fd[0].revents();
-                    if ready.intersects(PollFlags::ERR | PollFlags::HUP | PollFlags::NVAL) {
-                        return Err(VulkanError::DmabufWait(std::io::Error::other(format!(
-                            "DMA-BUF poll returned {ready:?}"
-                        ))));
-                    }
-                    if ready.contains(events) {
-                        break;
-                    }
-                }
-                Err(rustix::io::Errno::INTR) => continue,
-                Err(err) => return Err(VulkanError::DmabufWait(err.into())),
-            }
-        }
-    }
-    Ok(())
-}
-
-fn transfer_ownership(
+fn ownership_transfer(
     device: &wgpu::Device,
-    queue: &wgpu::Queue,
     image: vk::Image,
     acquire: bool,
-) -> Result<(), VulkanError> {
+) -> Result<wgpu::CommandBuffer, VulkanError> {
     // SAFETY: The supplied WGPU device keeps the dispatch table and Vulkan device
     // alive through recording and submission below.
     let device_guard = unsafe { device.as_hal::<Vulkan>() }.ok_or(VulkanError::NotVulkan)?;
@@ -663,10 +787,199 @@ fn transfer_ownership(
     };
     recorded?;
 
-    let submission = queue.submit([encoder.finish()]);
+    Ok(encoder.finish())
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct DmabufSyncFile {
+    flags: u32,
+    fd: i32,
+}
+
+const DMA_BUF_SYNC_READ: u32 = 1;
+const DMA_BUF_SYNC_WRITE: u32 = 2;
+const DMA_BUF_EXPORT_SYNC_FILE: rustix::ioctl::Opcode =
+    rustix::ioctl::opcode::read_write::<DmabufSyncFile>(b'b', 2);
+const DMA_BUF_IMPORT_SYNC_FILE: rustix::ioctl::Opcode =
+    rustix::ioctl::opcode::write::<DmabufSyncFile>(b'b', 3);
+
+fn dmabuf_sync_flags(write: bool) -> u32 {
+    if write {
+        DMA_BUF_SYNC_WRITE
+    } else {
+        DMA_BUF_SYNC_READ
+    }
+}
+
+fn export_dmabuf_sync_file(dmabuf: &Dmabuf, write: bool) -> Result<OwnedFd, VulkanError> {
+    let handle = dmabuf
+        .handles()
+        .next()
+        .expect("single-plane DMA-BUF has one file descriptor");
+    let mut request = DmabufSyncFile {
+        flags: dmabuf_sync_flags(write),
+        fd: -1,
+    };
+    loop {
+        // SAFETY: DMA_BUF_EXPORT_SYNC_FILE reads and updates exactly this UAPI
+        // structure; handle is a live DMA-BUF file descriptor.
+        let result = unsafe {
+            rustix::ioctl::ioctl(handle, Updater::<DMA_BUF_EXPORT_SYNC_FILE, _>::new(&mut request))
+        };
+        match result {
+            Ok(()) => break,
+            Err(rustix::io::Errno::INTR | rustix::io::Errno::AGAIN) => continue,
+            Err(err) => return Err(VulkanError::DmabufSync(err.into())),
+        }
+    }
+    if request.fd < 0 {
+        return Err(VulkanError::DmabufSync(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "DMA_BUF_IOCTL_EXPORT_SYNC_FILE returned an invalid file descriptor",
+        )));
+    }
+    // SAFETY: a successful export ioctl returned ownership of this descriptor.
+    Ok(unsafe { OwnedFd::from_raw_fd(request.fd) })
+}
+
+fn import_dmabuf_sync_file(dmabuf: &Dmabuf, write: bool, sync_file: &OwnedFd) -> Result<(), VulkanError> {
+    let handle = dmabuf
+        .handles()
+        .next()
+        .expect("single-plane DMA-BUF has one file descriptor");
+    let request = DmabufSyncFile {
+        flags: dmabuf_sync_flags(write),
+        fd: sync_file.as_raw_fd(),
+    };
+    loop {
+        // SAFETY: DMA_BUF_IMPORT_SYNC_FILE reads exactly this UAPI structure;
+        // both descriptors remain live for the ioctl call.
+        let result =
+            unsafe { rustix::ioctl::ioctl(handle, Setter::<DMA_BUF_IMPORT_SYNC_FILE, _>::new(request)) };
+        match result {
+            Ok(()) => return Ok(()),
+            Err(rustix::io::Errno::INTR | rustix::io::Errno::AGAIN) => continue,
+            Err(err) => return Err(VulkanError::DmabufSync(err.into())),
+        }
+    }
+}
+
+fn wait_dmabuf(dmabuf: &Dmabuf, write: bool) -> Result<(), VulkanError> {
+    let events = if write { PollFlags::OUT } else { PollFlags::IN };
+    for handle in dmabuf.handles() {
+        wait_fd(handle, events)?;
+    }
+    Ok(())
+}
+
+fn wait_sync_file(sync_file: &OwnedFd) -> Result<(), VulkanError> {
+    wait_fd(sync_file, PollFlags::IN)
+}
+
+fn wait_fd(fd: impl std::os::fd::AsFd, events: PollFlags) -> Result<(), VulkanError> {
+    loop {
+        let mut poll_fd = [PollFd::new(&fd, events)];
+        match rustix::event::poll(&mut poll_fd, None) {
+            Ok(_) => {
+                let ready = poll_fd[0].revents();
+                if ready.intersects(PollFlags::ERR | PollFlags::HUP | PollFlags::NVAL) {
+                    return Err(VulkanError::DmabufSync(std::io::Error::other(format!(
+                        "native fence poll returned {ready:?}"
+                    ))));
+                }
+                if ready.contains(events) {
+                    return Ok(());
+                }
+            }
+            Err(rustix::io::Errno::INTR) => continue,
+            Err(err) => return Err(VulkanError::DmabufSync(err.into())),
+        }
+    }
+}
+
+fn import_sync_file(
+    device: &wgpu::Device,
+    sync_file: OwnedFd,
+) -> Result<(ash::Device, vk::Semaphore), VulkanError> {
+    // SAFETY: the guard is used to clone live dispatch handles and is dropped
+    // before any WGPU call.
+    let device_guard = unsafe { device.as_hal::<Vulkan>() }.ok_or(VulkanError::NotVulkan)?;
+    if !device_guard
+        .enabled_device_extensions()
+        .contains(&khr::external_semaphore_fd::NAME)
+    {
+        return Err(VulkanError::MissingExtension("VK_KHR_external_semaphore_fd"));
+    }
+    let raw = device_guard.raw_device().clone();
+    let instance = device_guard.shared_instance().raw_instance().clone();
+    drop(device_guard);
+
+    // SAFETY: raw is a live Vulkan device and the default create info is valid.
+    let semaphore = unsafe { raw.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) }
+        .map_err(VulkanError::CreateSemaphore)?;
+    let external = khr::external_semaphore_fd::Device::new(&instance, &raw);
+    let fd = sync_file.into_raw_fd();
+    let import_info = vk::ImportSemaphoreFdInfoKHR::default()
+        .semaphore(semaphore)
+        .flags(vk::SemaphoreImportFlags::TEMPORARY)
+        .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD)
+        .fd(fd);
+    // SAFETY: semaphore is idle and fd owns a Linux sync_file. On success the
+    // Vulkan implementation consumes fd; on failure ownership remains here.
+    if let Err(err) = unsafe { external.import_semaphore_fd(&import_info) } {
+        // SAFETY: Vulkan did not consume fd when import failed.
+        drop(unsafe { OwnedFd::from_raw_fd(fd) });
+        // SAFETY: semaphore is idle and has never been submitted.
+        unsafe { raw.destroy_semaphore(semaphore, None) };
+        return Err(VulkanError::ImportSemaphore(err));
+    }
+    Ok((raw, semaphore))
+}
+
+fn create_exportable_semaphore(
+    device: &wgpu::Device,
+) -> Result<(ash::Device, khr::external_semaphore_fd::Device, vk::Semaphore), VulkanError> {
+    // SAFETY: the guard is used to clone live dispatch handles and is dropped
+    // before any WGPU call.
+    let device_guard = unsafe { device.as_hal::<Vulkan>() }.ok_or(VulkanError::NotVulkan)?;
+    if !device_guard
+        .enabled_device_extensions()
+        .contains(&khr::external_semaphore_fd::NAME)
+    {
+        return Err(VulkanError::MissingExtension("VK_KHR_external_semaphore_fd"));
+    }
+    let raw = device_guard.raw_device().clone();
+    let instance = device_guard.shared_instance().raw_instance().clone();
+    drop(device_guard);
+
+    let mut export_info =
+        vk::ExportSemaphoreCreateInfo::default().handle_types(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
+    let create_info = vk::SemaphoreCreateInfo::default().push_next(&mut export_info);
+    // SAFETY: raw is live and the enabled external-semaphore extension supports
+    // exporting binary semaphores as sync FDs.
+    let semaphore =
+        unsafe { raw.create_semaphore(&create_info, None) }.map_err(VulkanError::CreateSemaphore)?;
+    let external = khr::external_semaphore_fd::Device::new(&instance, &raw);
+    Ok((raw, external, semaphore))
+}
+
+fn destroy_after_submission(queue: &wgpu::Queue, raw: ash::Device, semaphore: vk::Semaphore) {
+    queue.on_submitted_work_done(move || {
+        // SAFETY: the callback runs only after every submission made before it
+        // has completed, including the one which consumed this semaphore.
+        unsafe { raw.destroy_semaphore(semaphore, None) };
+    });
+}
+
+fn retain_after_submission(queue: &wgpu::Queue, texture: wgpu::Texture) {
+    queue.on_submitted_work_done(move || drop(texture));
+}
+
+fn wait_for_submission(device: &wgpu::Device, submission: &wgpu::SubmissionIndex) -> Result<(), VulkanError> {
     device
         .poll(wgpu::PollType::Wait {
-            submission_index: Some(submission),
+            submission_index: Some(submission.clone()),
             timeout: None,
         })
         .map(|_| ())

@@ -5,14 +5,15 @@
 //!
 //! ## Usage
 //!
-//! The backend is initialized using one of the [`init`], [`init_from_attributes`] or
+//! The GLES backend is initialized using one of the [`init`], [`init_from_attributes`] or
 //! [`init_from_attributes_with_gl_attr`] functions, depending on the amount of control
-//! you want on the initialization of the backend. These functions will provide you
-//! with two objects:
+//! you want on the initialization of the backend. With `renderer_wgpu`,
+//! `init_wgpu_from_attributes` initializes a WGPU backend. These functions provide two objects:
 //!
 //! - a [`WinitGraphicsBackend`], which can give you an implementation of a [`Renderer`](crate::backend::renderer::Renderer)
 //!   (or even [`GlesRenderer`]) through its `renderer` method in addition to further
 //!   functionality to access and manage the created winit-window.
+//! - for WGPU, a `WgpuGraphicsBackend` with the corresponding renderer and window surface.
 //! - a [`WinitEventLoop`], which dispatches some [`WinitEvent`] from the host graphics server.
 //!
 //! The other types in this module are the instances of the associated types of these
@@ -60,8 +61,12 @@ use crate::{
 };
 
 mod input;
+#[cfg(feature = "renderer_wgpu")]
+mod wgpu;
 
 pub use self::input::*;
+#[cfg(feature = "renderer_wgpu")]
+pub use self::wgpu::{WgpuGraphicsBackend, WgpuInitError, init_wgpu_from_attributes};
 
 /// Create a new [`WinitGraphicsBackend`], which implements the
 /// [`Renderer`](crate::backend::renderer::Renderer) trait and a corresponding [`WinitEventLoop`].
@@ -111,64 +116,86 @@ where
     R: From<GlesRenderer> + Bind<EGLSurface>,
     crate::backend::SwapBuffersError: From<R::Error>,
 {
-    let span = info_span!("backend_winit", window = tracing::field::Empty);
-    let _guard = span.enter();
-    info!("Initializing a winit backend");
-
-    let mut event_loop = EventLoop::builder().build().map_err(Error::EventLoopCreation)?;
-
-    let mut window_event_loop_inner = WinitEventLoopInner {
-        window_attributes: attributes,
-        scale_factor: 1.0,
-        pinch_gesture_state: PinchGestureState::default(),
-        key_counter: 0,
-        // Will be initialized after window creation
-        window: None,
-        window_create_error: None,
-        is_x11: false,
-    };
-    let mut initial_events = Vec::new();
-    while window_event_loop_inner.window.is_none() {
-        event_loop.pump_app_events(
-            None,
-            &mut WinitEventLoopApp {
-                inner: &mut window_event_loop_inner,
-                callback: |evt| initial_events.push(evt),
-            },
-        );
-        if let Some(err) = window_event_loop_inner.window_create_error {
-            return Err(err);
-        }
-    }
-    let window = window_event_loop_inner.window.clone().unwrap();
-
-    window_event_loop_inner.is_x11 = matches!(
-        window.window_handle().map(|handle| handle.as_raw()),
-        Ok(RawWindowHandle::Xlib(_))
-    );
-
-    span.record("window", window.id().into_raw());
-    debug!("Window created");
+    let setup = WinitWindowSetup::new(attributes)?;
+    let _guard = setup.span.enter();
 
     let winit_graphics_backend =
-        WinitGraphicsBackend::new_with_gl_attr(window.clone(), &span, gl_attributes)?;
+        WinitGraphicsBackend::new_with_gl_attr(setup.window.clone(), &setup.span, gl_attributes)?;
 
     drop(_guard);
 
-    event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
-    let event_loop = Generic::new(event_loop, Interest::READ, calloop::Mode::Level);
+    Ok((winit_graphics_backend, setup.into_event_loop()))
+}
 
-    Ok((
-        winit_graphics_backend,
-        WinitEventLoop {
-            inner: window_event_loop_inner,
-            fake_token: None,
+struct WinitWindowSetup {
+    event_loop: EventLoop,
+    inner: WinitEventLoopInner,
+    initial_events: Vec<WinitEvent>,
+    window: Arc<dyn WinitWindow>,
+    span: tracing::Span,
+}
+
+impl WinitWindowSetup {
+    fn new(attributes: WindowAttributes) -> Result<Self, Error> {
+        let span = info_span!("backend_winit", window = tracing::field::Empty);
+        let _guard = span.enter();
+        info!("Initializing a winit backend");
+
+        let mut event_loop = EventLoop::builder().build().map_err(Error::EventLoopCreation)?;
+        let mut inner = WinitEventLoopInner {
+            window_attributes: attributes,
+            scale_factor: 1.0,
+            pinch_gesture_state: PinchGestureState::default(),
+            key_counter: 0,
+            // Will be initialized after window creation
+            window: None,
+            window_create_error: None,
+            is_x11: false,
+        };
+        let mut initial_events = Vec::new();
+        while inner.window.is_none() {
+            event_loop.pump_app_events(
+                None,
+                &mut WinitEventLoopApp {
+                    inner: &mut inner,
+                    callback: |evt| initial_events.push(evt),
+                },
+            );
+            if let Some(err) = inner.window_create_error.take() {
+                return Err(err);
+            }
+        }
+        let window = inner.window.clone().unwrap();
+        inner.is_x11 = matches!(
+            window.window_handle().map(|handle| handle.as_raw()),
+            Ok(RawWindowHandle::Xlib(_))
+        );
+
+        span.record("window", window.id().into_raw());
+        debug!("Window created");
+        drop(_guard);
+
+        Ok(Self {
             event_loop,
+            inner,
             initial_events,
-            pending_events: Vec::new(),
+            window,
             span,
-        },
-    ))
+        })
+    }
+
+    fn into_event_loop(self) -> WinitEventLoop {
+        self.event_loop
+            .set_control_flow(winit::event_loop::ControlFlow::Poll);
+        WinitEventLoop {
+            inner: self.inner,
+            fake_token: None,
+            event_loop: Generic::new(self.event_loop, Interest::READ, calloop::Mode::Level),
+            initial_events: self.initial_events,
+            pending_events: Vec::new(),
+            span: self.span,
+        }
+    }
 }
 
 /// Errors thrown by the `winit` backends
