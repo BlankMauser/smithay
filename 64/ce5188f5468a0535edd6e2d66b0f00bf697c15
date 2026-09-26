@@ -1,0 +1,37 @@
+CHANGELOG.md
+  s_4c286d889ffe7e::t_e9c7fe8465b72f 262-268
+README.md
+  s_4c286d889ffe7e::t_30b9bb099f6192 62
+anvil/src/input_handler.rs
+  s_4c286d889ffe7e::t_7312ddc9805e2f 12-13,20-23,56,242-343,748-757
+anvil/src/winit.rs
+  s_4c286d889ffe7e::t_45f9adad02e248 84-85
+src/backend/renderer/gles/mod.rs
+  s_4c286d889ffe7e::t_d7589b686914b3 327,336,339-350,380,831,841,844-845,2369,2376,2578,3619-3674
+src/backend/winit/input.rs
+  s_4c286d889ffe7e::t_1f5a8cb40704e7 10-13,36-39,303,353-490,538-542
+src/backend/winit/mod.rs
+  s_4c286d889ffe7e::t_79bc4de53f936c 22,30-31,123,398,401-445,730-816
+src/desktop/wayland/utils.rs
+  s_4c286d889ffe7e::t_245d135055ced1 218-220,236-242,244-248,505-513
+src/wayland/session_lock/surface.rs
+  s_4c286d889ffe7e::t_381a8e03b5c243 305-308
+src/wayland/shell/wlr_layer/mod.rs
+  s_4c286d889ffe7e::t_6fd2835273509b 487-490
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "64ce5188f5468a0535edd6e2d66b0f00bf697c15",
+  "prompts": {},
+  "sessions": {
+    "s_4c286d889ffe7e": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0d4cb-82c9-7df1-836a-73ee56cd5949",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "BlankMauser <thomasluvan@gmail.com>"
+    }
+  }
+}
