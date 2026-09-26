@@ -1,0 +1,21 @@
+src/backend/renderer/wgpu/frame.rs
+  s_4c286d889ffe7e::t_9d18cfbc54f631 12
+src/backend/renderer/wgpu/mod.rs
+  s_4c286d889ffe7e::t_308a0d9808288e 469-477,745,777
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "bcbfbb624f55c8a1d72e3ed9dc9c81a1ea2aa500",
+  "prompts": {},
+  "sessions": {
+    "s_4c286d889ffe7e": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0d4cb-82c9-7df1-836a-73ee56cd5949",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "BlankMauser <thomasluvan@gmail.com>"
+    }
+  }
+}
