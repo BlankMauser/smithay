@@ -259,6 +259,13 @@ source device, so those devices accumulate cached imports that previously were n
 Cleanup is now also attempted on every device even if it fails on one of them, with every failure
 logged and the first error returned.
 
+`send_frames_surface_tree` (and `Window::send_frame`, `LayerSurface::send_frame`) no longer sends frame
+callbacks to surfaces whose renderer state has no buffer, or to their subsurfaces.
+
+`GlesRenderer::cleanup_texture_cache` and `GlesRenderer::invalidate_caches` now only make their EGL
+context current when resources are queued for destruction. This avoids waking idle GPUs and
+blocking the compositor while they resume.
+
 ## 0.7.0
 
 ### Breaking changes
