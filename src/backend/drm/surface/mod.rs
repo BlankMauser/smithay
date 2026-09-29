@@ -441,6 +441,47 @@ impl DrmSurface {
         }
     }
 
+    /// Whether the device accepts asynchronous (tearing) page flips through the API this
+    /// surface uses: `DRM_CAP_ATOMIC_ASYNC_PAGE_FLIP` for atomic surfaces (Linux 6.8 and
+    /// later), `DRM_CAP_ASYNC_PAGE_FLIP` for legacy ones.
+    ///
+    /// A supported device may still refuse a particular asynchronous flip, for example
+    /// one that also moves a cursor or overlay plane; see [`DrmSurface::page_flip_async`].
+    pub fn supports_async_page_flip(&self) -> bool {
+        let capability = if self.is_legacy() {
+            drm::DriverCapability::ASyncPageFlip
+        } else {
+            drm::DriverCapability::AtomicASyncPageFlip
+        };
+        self.get_driver_capability(capability)
+            .is_ok_and(|value| value != 0)
+    }
+
+    /// Page-flip the underlying [`crtc`](drm::control::crtc) to a new given set of
+    /// [`framebuffer`]s as soon as possible rather than at the next vblank
+    /// (`DRM_MODE_PAGE_FLIP_ASYNC`), so the new frame may tear.
+    ///
+    /// Like [`DrmSurface::page_flip`] this does not modeset and produces a `vblank` event
+    /// (when the flip completes) if `event` is set. Only the primary plane's framebuffer
+    /// may change: the kernel refuses (`EINVAL`) an asynchronous flip that changes any
+    /// other plane or property, and devices without
+    /// [`DrmSurface::supports_async_page_flip`] refuse every one. Callers should fall back
+    /// to [`DrmSurface::page_flip`] when it fails.
+    #[profiling::function]
+    pub fn page_flip_async<'a>(
+        &self,
+        planes: impl IntoIterator<Item = PlaneState<'a>>,
+        event: bool,
+    ) -> Result<(), Error> {
+        match &*self.internal {
+            DrmSurfaceInternal::Atomic(surf) => surf.page_flip_async(planes, event),
+            DrmSurfaceInternal::Legacy(surf) => {
+                let fb = ensure_legacy_planes(self, planes)?;
+                surf.page_flip_async(fb, event)
+            }
+        }
+    }
+
     /// Returns a set of available planes for this surface
     pub fn planes(&self) -> &Planes {
         &self.planes

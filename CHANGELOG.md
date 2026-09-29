@@ -125,6 +125,11 @@ is used for timestamps for synthesized events.
 
 ### Additions
 
+- Add asynchronous (tearing) page flips: `DrmSurface::supports_async_page_flip` and
+  `DrmSurface::page_flip_async` (`DRM_MODE_PAGE_FLIP_ASYNC` on atomic and legacy surfaces), and
+  `DrmCompositor::queue_frame_async` / `DrmOutput::queue_frame_async`, which fall back to a
+  vblank-synchronized flip when the device or the kernel refuses; `DrmCompositor::pending_frame_async`
+  reports which kind of flip is in flight.
 - Add `WmWindowProperty::Other` to forward unrecognized X11 property changes to the compositor.
 
 - ExtBackgroundEffect protocol is now available in `smithay::wayland::background_effect` module.

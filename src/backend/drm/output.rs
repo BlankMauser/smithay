@@ -727,6 +727,14 @@ where
         self.with_compositor(|compositor| compositor.queue_frame(user_data))
     }
 
+    /// Queues the current frame for scan-out as soon as possible, so it may tear.
+    ///
+    /// See [`DrmCompositor::queue_frame_async`] for when it falls back to a
+    /// vblank-synchronized flip.
+    pub fn queue_frame_async(&mut self, user_data: U) -> FrameResult<(), A, F> {
+        self.with_compositor(|compositor| compositor.queue_frame_async(user_data))
+    }
+
     /// Commits the current frame for scan-out.
     ///
     /// If `render_frame` has not been called prior to this function or returned no damage

@@ -870,6 +870,30 @@ impl AtomicDrmSurface {
         planes: impl IntoIterator<Item = PlaneState<'a>>,
         event: bool,
     ) -> Result<(), Error> {
+        self.page_flip_with(planes, event, false)
+    }
+
+    /// Like [`AtomicDrmSurface::page_flip`], but asks the kernel to flip as soon as
+    /// possible instead of at the next vblank (`DRM_MODE_PAGE_FLIP_ASYNC`), so the new
+    /// framebuffer may tear. The kernel refuses (`EINVAL`) an asynchronous commit that
+    /// changes a property other than the primary plane's `FB_ID`, `IN_FENCE_FD` or
+    /// `FB_DAMAGE_CLIPS`, or one the driver cannot flip asynchronously.
+    #[instrument(level = "trace", parent = &self.span, skip(self, planes))]
+    #[profiling::function]
+    pub fn page_flip_async<'a>(
+        &self,
+        planes: impl IntoIterator<Item = PlaneState<'a>>,
+        event: bool,
+    ) -> Result<(), Error> {
+        self.page_flip_with(planes, event, true)
+    }
+
+    fn page_flip_with<'a>(
+        &self,
+        planes: impl IntoIterator<Item = PlaneState<'a>>,
+        event: bool,
+        tearing: bool,
+    ) -> Result<(), Error> {
         if !self.active.load(Ordering::SeqCst) {
             return Err(Error::DeviceInactive);
         }
@@ -892,24 +916,25 @@ impl AtomicDrmSurface {
         // .. and without `AtomicCommitFlags::AllowModeset`.
         // If we would set anything here, that would require a modeset, this would fail,
         // indicating a problem in our assumptions.
-        trace!(?planes, "Queueing page flip: {:?}", req);
-        let res = self
-            .fd
-            .atomic_commit(
-                if event {
-                    AtomicCommitFlags::PAGE_FLIP_EVENT | AtomicCommitFlags::NONBLOCK
+        trace!(?planes, tearing, "Queueing page flip: {:?}", req);
+        let mut flags = AtomicCommitFlags::NONBLOCK;
+        if event {
+            flags |= AtomicCommitFlags::PAGE_FLIP_EVENT;
+        }
+        if tearing {
+            flags |= AtomicCommitFlags::PAGE_FLIP_ASYNC;
+        }
+        let res = self.fd.atomic_commit(flags, req.build()?).map_err(|source| {
+            Error::Access(AccessError {
+                errmsg: if tearing {
+                    "Async page flip commit failed"
                 } else {
-                    AtomicCommitFlags::NONBLOCK
+                    "Page flip commit failed"
                 },
-                req.build()?,
-            )
-            .map_err(|source| {
-                Error::Access(AccessError {
-                    errmsg: "Page flip commit failed",
-                    dev: self.fd.dev_path(),
-                    source,
-                })
-            });
+                dev: self.fd.dev_path(),
+                source,
+            })
+        });
 
         if res.is_ok() {
             for plane in planes.iter() {

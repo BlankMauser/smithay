@@ -334,7 +334,24 @@ impl LegacyDrmSurface {
     #[instrument(level = "trace", parent = &self.span, skip(self))]
     #[profiling::function]
     pub fn page_flip(&self, framebuffer: framebuffer::Handle, event: bool) -> Result<(), Error> {
-        trace!("Queueing Page flip");
+        self.page_flip_with(framebuffer, event, false)
+    }
+
+    /// Like [`LegacyDrmSurface::page_flip`], but flips as soon as possible instead of at
+    /// the next vblank (`DRM_MODE_PAGE_FLIP_ASYNC`), so the new framebuffer may tear.
+    #[instrument(level = "trace", parent = &self.span, skip(self))]
+    #[profiling::function]
+    pub fn page_flip_async(&self, framebuffer: framebuffer::Handle, event: bool) -> Result<(), Error> {
+        self.page_flip_with(framebuffer, event, true)
+    }
+
+    fn page_flip_with(
+        &self,
+        framebuffer: framebuffer::Handle,
+        event: bool,
+        tearing: bool,
+    ) -> Result<(), Error> {
+        trace!(tearing, "Queueing Page flip");
 
         if !self.active.load(Ordering::SeqCst) {
             return Err(Error::DeviceInactive);
@@ -351,10 +368,11 @@ impl LegacyDrmSurface {
             &*self.fd,
             self.crtc,
             framebuffer,
-            if event {
-                PageFlipFlags::EVENT
-            } else {
-                PageFlipFlags::empty()
+            match (event, tearing) {
+                (true, true) => PageFlipFlags::EVENT | PageFlipFlags::ASYNC,
+                (true, false) => PageFlipFlags::EVENT,
+                (false, true) => PageFlipFlags::ASYNC,
+                (false, false) => PageFlipFlags::empty(),
             },
             None,
         )
