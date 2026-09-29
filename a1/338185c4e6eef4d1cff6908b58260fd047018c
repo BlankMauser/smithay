@@ -1,0 +1,43 @@
+src/backend/drm/surface/atomic.rs
+  s_c9dc4e27cff5fb::t_ebe5a0d0422362 872-895
+  s_c9dc4e27cff5fb::t_13e1deef80bbdc 919-930,932,934-937
+src/backend/drm/surface/mod.rs
+  s_c9dc4e27cff5fb::t_6955a4179b94de 444-484
+src/backend/drm/surface/legacy.rs
+  s_c9dc4e27cff5fb::t_67152a06a2295b 337-349
+  s_c9dc4e27cff5fb::t_c7326e710237eb 350-354,371-375
+src/backend/drm/output.rs
+  s_c9dc4e27cff5fb::t_3cc931f83e1ec8 730-737
+src/backend/drm/compositor/mod.rs
+  s_c9dc4e27cff5fb::t_bb35260f1435b4 2606,2610,2612,2616-2639,2712
+  s_c9dc4e27cff5fb::t_69c14fb00ef0e3 1085
+  s_c9dc4e27cff5fb::t_6e3b788ec044f1 762-775
+  s_c9dc4e27cff5fb::t_e0f2601e4eb5c5 1002
+  s_c9dc4e27cff5fb::t_75f00c3ce67c73 962-963
+  s_c9dc4e27cff5fb::t_fe2f3543d8ce79 761,2468-2501,2654
+  s_c9dc4e27cff5fb::t_a930f5b4d6aece 2527
+  s_c9dc4e27cff5fb::t_4b77922528f08a 2710
+  s_c9dc4e27cff5fb::t_d39a01ac9e6c0b 986-987
+  s_c9dc4e27cff5fb::t_e6886a0b1295b6 1293
+  s_c9dc4e27cff5fb::t_b4d1f050b62ac9 978
+  s_c9dc4e27cff5fb::t_7da24f827a29d9 1477
+  s_c9dc4e27cff5fb::t_b9fba3b264e5b1 1229,1414,2640-2641,2711,2713
+CHANGELOG.md
+  s_c9dc4e27cff5fb::t_41a8ad178df721 128-132
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "a1338185c4e6eef4d1cff6908b58260fd047018c",
+  "prompts": {},
+  "sessions": {
+    "s_c9dc4e27cff5fb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "0aff59e7-c99a-406c-89ea-3a60805d1398",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "BlankMauser <thomasluvan@gmail.com>"
+    }
+  }
+}
