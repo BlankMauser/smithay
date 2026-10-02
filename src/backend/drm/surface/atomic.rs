@@ -6,9 +6,7 @@ use drm::control::{
     AtomicCommitFlags, Mode, PlaneType, connector, crtc, dumbbuffer::DumbBuffer, framebuffer, plane, property,
 };
 
-#[cfg(debug_assertions)]
-use std::collections::HashMap;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 #[cfg(debug_assertions)]
 use std::fmt;
 use std::os::unix::io::AsRawFd;
@@ -35,7 +33,8 @@ use crate::{
 
 use tracing::{debug, info, info_span, instrument, trace, warn};
 
-use super::{PlaneConfig, PlaneState, VrrSupport};
+use super::color::{ColorProperties, ColorValues, ConnectorColor};
+use super::{ConnectorColorCapabilities, ConnectorColorState, PlaneConfig, PlaneState, VrrSupport};
 
 #[derive(Debug, Clone)]
 pub struct State {
@@ -44,6 +43,7 @@ pub struct State {
     pub blob: property::Value<'static>,
     pub vrr: bool,
     pub connectors: HashSet<connector::Handle>,
+    pub(super) colors: HashMap<connector::Handle, ConnectorColor>,
 }
 
 impl PartialEq for State {
@@ -53,6 +53,7 @@ impl PartialEq for State {
             && self.mode == other.mode
             && self.vrr == other.vrr
             && self.connectors == other.connectors
+            && self.colors == other.colors
     }
 }
 
@@ -141,6 +142,11 @@ impl State {
             }
         }
 
+        let colors = current_connectors
+            .iter()
+            .map(|conn| ColorProperties::read(fd, *conn).map(|props| (*conn, props.current())))
+            .collect::<Result<_, _>>()?;
+
         Ok(State {
             // If we don't know the active state we just assume off.
             // This is highly unlikely, but having a false negative should do no harm.
@@ -150,6 +156,7 @@ impl State {
             // If we don't know the VRR state, the driver doesn't support the property
             vrr: vrr.unwrap_or(false),
             connectors: current_connectors,
+            colors,
         })
     }
 
@@ -157,6 +164,7 @@ impl State {
         self.mode = unsafe { std::mem::zeroed() };
         self.blob = property::Value::Unknown(0);
         self.connectors.clear();
+        self.colors.clear();
         self.active = false;
         self.vrr = false;
     }
@@ -201,12 +209,22 @@ impl AtomicDrmSurface {
                 source,
             })
         })?;
+        let colors = connectors
+            .iter()
+            .map(|conn| {
+                let props = ColorProperties::read(&*fd, *conn)?;
+                props
+                    .prepare(fd.device_fd(), *conn, ConnectorColorState::default())
+                    .map(|color| (*conn, color))
+            })
+            .collect::<Result<_, Error>>()?;
         let pending = State {
             active: true,
             mode,
             blob,
             vrr: false,
             connectors: connectors.iter().copied().collect(),
+            colors,
         };
 
         drop(_guard);
@@ -291,6 +309,50 @@ impl AtomicDrmSurface {
         self.pending.read().unwrap().mode
     }
 
+    pub fn color_capabilities(&self, conn: connector::Handle) -> Result<ConnectorColorCapabilities, Error> {
+        if !self.active.load(Ordering::SeqCst) {
+            return Err(Error::DeviceInactive);
+        }
+        if !self.pending.read().unwrap().connectors.contains(&conn) {
+            return Err(Error::UnknownConnector(conn));
+        }
+        Ok(ColorProperties::read(&*self.fd, conn)?.capabilities())
+    }
+
+    pub fn set_color_state(&self, conn: connector::Handle, state: ConnectorColorState) -> Result<(), Error> {
+        if !self.active.load(Ordering::SeqCst) {
+            return Err(Error::DeviceInactive);
+        }
+        let mut pending = self.pending.write().unwrap();
+        if !pending.connectors.contains(&conn) {
+            return Err(Error::UnknownConnector(conn));
+        }
+        if pending.colors.get(&conn).and_then(|color| color.state) == Some(state) {
+            return Ok(());
+        }
+        let color = ColorProperties::read(&*self.fd, conn)?.prepare(self.device_fd(), conn, state)?;
+        pending.colors.insert(conn, color);
+        Ok(())
+    }
+
+    pub fn pending_color_state(&self, conn: connector::Handle) -> Option<ConnectorColorState> {
+        self.pending
+            .read()
+            .unwrap()
+            .colors
+            .get(&conn)
+            .and_then(|color| color.state)
+    }
+
+    pub fn current_color_state(&self, conn: connector::Handle) -> Option<ConnectorColorState> {
+        self.state
+            .read()
+            .unwrap()
+            .colors
+            .get(&conn)
+            .and_then(|color| color.state)
+    }
+
     fn ensure_props_known(&self, conns: &[connector::Handle]) -> Result<(), Error> {
         let mapping_exists = {
             let prop_mapping = self.prop_mapping.read().unwrap();
@@ -336,6 +398,14 @@ impl AtomicDrmSurface {
 
         // check if the connector can handle the current mode
         if info.modes().contains(&pending.mode) {
+            let color = match pending.colors.get(&conn) {
+                Some(color) => color.clone(),
+                None => ColorProperties::read(&*self.fd, conn)?.prepare(
+                    self.device_fd(),
+                    conn,
+                    ConnectorColorState::default(),
+                )?,
+            };
             let test_buffer = self.create_test_buffer(pending.mode.size(), self.plane)?;
 
             // check if config is supported
@@ -362,7 +432,16 @@ impl AtomicDrmSurface {
                 self.crtc,
                 Some(pending.blob),
                 pending.vrr,
-                &connectors,
+                connectors.iter().map(|connector| {
+                    (
+                        connector,
+                        if *connector == conn {
+                            Some(&color)
+                        } else {
+                            pending.colors.get(connector)
+                        },
+                    )
+                }),
                 [],
                 [&plane_state],
             )?;
@@ -375,6 +454,7 @@ impl AtomicDrmSurface {
 
             // seems to be, lets add the connector
             pending.connectors.insert(conn);
+            pending.colors.insert(conn, color);
 
             Ok(())
         } else {
@@ -421,8 +501,8 @@ impl AtomicDrmSurface {
             self.crtc,
             Some(pending.blob),
             pending.vrr,
-            &connectors,
-            [&conn],
+            connectors.iter().map(|conn| (conn, pending.colors.get(conn))),
+            [(&conn, pending.colors.get(&conn))],
             [&plane_state],
         )?;
         self.fd
@@ -434,6 +514,7 @@ impl AtomicDrmSurface {
 
         // seems to be, lets remove the connector
         pending.connectors.remove(&conn);
+        pending.colors.remove(&conn);
 
         Ok(())
     }
@@ -455,6 +536,20 @@ impl AtomicDrmSurface {
         self.ensure_props_known(connectors)?;
         let conns = connectors.iter().cloned().collect::<HashSet<_>>();
         let removed = current.connectors.difference(&conns);
+        let colors = conns
+            .iter()
+            .map(|conn| {
+                let color = match pending.colors.get(conn) {
+                    Some(color) => color.clone(),
+                    None => ColorProperties::read(&*self.fd, *conn)?.prepare(
+                        self.device_fd(),
+                        *conn,
+                        ConnectorColorState::default(),
+                    )?,
+                };
+                Ok((*conn, color))
+            })
+            .collect::<Result<HashMap<_, _>, Error>>()?;
 
         let test_buffer = self.create_test_buffer(pending.mode.size(), self.plane)?;
 
@@ -478,8 +573,8 @@ impl AtomicDrmSurface {
             self.crtc,
             Some(pending.blob),
             pending.vrr,
-            &conns,
-            removed,
+            conns.iter().map(|conn| (conn, colors.get(conn))),
+            removed.map(|conn| (conn, current.colors.get(conn))),
             [&plane_state],
         )?;
 
@@ -491,6 +586,7 @@ impl AtomicDrmSurface {
             .map_err(|_| Error::TestFailed(self.crtc))?;
 
         pending.connectors = conns;
+        pending.colors = colors;
 
         Ok(())
     }
@@ -532,7 +628,10 @@ impl AtomicDrmSurface {
             self.crtc,
             Some(new_blob),
             pending.vrr,
-            pending.connectors.iter(),
+            pending
+                .connectors
+                .iter()
+                .map(|conn| (conn, pending.colors.get(conn))),
             [],
             [&plane_state],
         )?;
@@ -655,8 +754,11 @@ impl AtomicDrmSurface {
             self.crtc,
             Some(pending.blob),
             value,
-            &pending.connectors,
-            &[],
+            pending
+                .connectors
+                .iter()
+                .map(|conn| (conn, pending.colors.get(conn))),
+            [],
             [&plane_config],
         )?;
 
@@ -725,8 +827,8 @@ impl AtomicDrmSurface {
             self.crtc,
             Some(pending.blob),
             pending.vrr,
-            &pending_conns,
-            removed,
+            pending_conns.iter().map(|conn| (conn, pending.colors.get(conn))),
+            removed.map(|conn| (conn, current.colors.get(conn))),
             &*planes,
         )?;
 
@@ -797,8 +899,8 @@ impl AtomicDrmSurface {
                 self.crtc,
                 Some(pending.blob),
                 pending.vrr,
-                &pending_conns,
-                removed,
+                pending_conns.iter().map(|conn| (conn, pending.colors.get(conn))),
+                removed.map(|conn| (conn, current.colors.get(conn))),
                 &*planes,
             )?;
 
@@ -810,12 +912,6 @@ impl AtomicDrmSurface {
 
                 return Err(Error::TestFailed(self.crtc));
             } else {
-                if current.mode != pending.mode {
-                    if let Err(err) = self.fd.destroy_property_blob(current.blob.into()) {
-                        warn!("Failed to destroy old mode property blob: {}", err);
-                    }
-                }
-
                 // new config
                 req
             }
@@ -850,6 +946,11 @@ impl AtomicDrmSurface {
             });
 
         if result.is_ok() {
+            if current.mode != pending.mode {
+                if let Err(err) = self.fd.destroy_property_blob(current.blob.into()) {
+                    warn!("Failed to destroy old mode property blob: {}", err);
+                }
+            }
             *current = pending.clone();
             for plane in planes.iter() {
                 if plane.config.is_some() {
@@ -963,6 +1064,7 @@ impl AtomicDrmSurface {
         }
 
         let _guard = self.span.enter();
+        let current = self.state.read().unwrap();
         let prop_mapping = self.prop_mapping.read().unwrap();
         let mut req = AtomicRequest::new(&prop_mapping);
         // reset all planes we used
@@ -971,9 +1073,11 @@ impl AtomicDrmSurface {
         }
 
         // disable connectors again
-        let current = self.state.read().unwrap();
         for conn in current.connectors.iter() {
             req.reset_connector(*conn)?;
+            if let Some(color) = current.colors.get(conn) {
+                req.set_connector_color(*conn, color.reset_values())?;
+            }
         }
 
         // disable crtc
@@ -1003,14 +1107,27 @@ impl AtomicDrmSurface {
         &self,
         fd: Option<&B>,
     ) -> Result<(), Error> {
-        *self.state.write().unwrap() = if let Some(fd) = fd {
+        let mut current = self.state.write().unwrap();
+        let mut pending = self.pending.write().unwrap();
+        let restored = if let Some(fd) = fd {
             State::current_state(fd, self.crtc, &mut self.prop_mapping.write().unwrap())?
         } else {
             State::current_state(&*self.fd, self.crtc, &mut self.prop_mapping.write().unwrap())?
         };
 
+        // Recreate all owned blobs before replacing pending state. A failure keeps
+        // the previous owned state alive for a retry, including its HDR metadata.
+        let colors = pending
+            .colors
+            .iter()
+            .map(|(conn, color)| {
+                let props = ColorProperties::read(&*self.fd, *conn)?;
+                props
+                    .prepare(self.device_fd(), *conn, color.state.unwrap_or_default())
+                    .map(|color| (*conn, color))
+            })
+            .collect::<Result<_, Error>>()?;
         // Re-initialize the mode blob which might got lost after suspend/resume
-        let mut pending = self.pending.write().unwrap();
         let blob = self.fd.create_property_blob(&pending.mode).map_err(|source| {
             Error::Access(AccessError {
                 errmsg: "Failed to create Property Blob for mode",
@@ -1020,6 +1137,8 @@ impl AtomicDrmSurface {
         })?;
 
         let old_blob = std::mem::replace(&mut pending.blob, blob);
+        pending.colors = colors;
+        *current = restored;
         let _ = self.fd.destroy_property_blob(old_blob.into());
 
         Ok(())
@@ -1100,37 +1219,6 @@ impl From<Transform> for DrmRotation {
             Transform::Flipped180 => DrmRotation::REFLECT_Y | DrmRotation::ROTATE_180,
             Transform::Flipped270 => DrmRotation::REFLECT_Y | DrmRotation::ROTATE_270,
         }
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use crate::{
-        backend::drm::surface::atomic::to_fixed,
-        utils::{Physical, Rectangle},
-    };
-
-    use super::AtomicDrmSurface;
-
-    fn is_send<S: Send>() {}
-
-    #[test]
-    fn surface_is_send() {
-        is_send::<AtomicDrmSurface>();
-    }
-
-    #[test]
-    fn test_fixed_point() {
-        let geometry: Rectangle<f64, Physical> = Rectangle::from_size((1920.0, 1080.0).into());
-        let fixed = to_fixed(geometry.size.w) as u64;
-        assert_eq!(125829120, fixed);
-    }
-
-    #[test]
-    fn test_fractional_fixed_point() {
-        let geometry: Rectangle<f64, Physical> = Rectangle::from_size((1920.1, 1080.0).into());
-        let fixed = to_fixed(geometry.size.w) as u64;
-        assert_eq!(125835674, fixed);
     }
 }
 
@@ -1638,13 +1726,38 @@ impl<'a> AtomicRequest<'a> {
 }
 
 impl<'a> AtomicRequest<'a> {
+    fn set_connector_color(&mut self, conn: connector::Handle, values: ColorValues) -> Result<(), Error> {
+        for (name, value) in [
+            ("HDR_OUTPUT_METADATA", values.hdr_metadata),
+            ("Colorspace", values.colorspace),
+            ("max bpc", values.max_bpc),
+        ] {
+            let Some(value) = value else {
+                continue;
+            };
+            let handle = self.mapping.conn_prop_handle(conn, name)?;
+            #[cfg(debug_assertions)]
+            {
+                let _ = handle;
+                self.connector_props
+                    .entry(conn)
+                    .or_default()
+                    .insert(name, property::Value::Unknown(value));
+            }
+            #[cfg(not(debug_assertions))]
+            self.request
+                .add_property(conn, handle, property::Value::Unknown(value));
+        }
+        Ok(())
+    }
+
     fn build_request(
         mapping: &'a PropMapping,
         crtc: crtc::Handle,
         blob: Option<property::Value<'static>>,
         vrr: bool,
-        connectors: impl IntoIterator<Item = &'a connector::Handle>,
-        removed_connectors: impl IntoIterator<Item = &'a connector::Handle>,
+        connectors: impl IntoIterator<Item = (&'a connector::Handle, Option<&'a ConnectorColor>)>,
+        removed_connectors: impl IntoIterator<Item = (&'a connector::Handle, Option<&'a ConnectorColor>)>,
         planes: impl IntoIterator<Item = &'a PlaneState<'a>>,
     ) -> Result<AtomicRequest<'a>, Error> {
         let mut req = AtomicRequest::new(mapping);
@@ -1653,16 +1766,22 @@ impl<'a> AtomicRequest<'a> {
         // for different drm objects (crtc, plane, connector, ...).
 
         // for every connector that is new, we need to set our crtc_id
-        for conn in connectors {
+        for (conn, color) in connectors {
             req.set_connector(*conn, crtc)?;
+            if let Some(color) = color {
+                req.set_connector_color(*conn, color.values)?;
+            }
         }
 
         // for every connector that got removed, we need to set no crtc_id.
         // (this is a bit problematic, because this means we need to remove, commit, add, commit
         // in the right order to move a connector to another surface. otherwise we disable the
         // the connector here again...)
-        for conn in removed_connectors {
+        for (conn, color) in removed_connectors {
             req.reset_connector(*conn)?;
+            if let Some(color) = color {
+                req.set_connector_color(*conn, color.reset_values())?;
+            }
         }
 
         // Set the crtc properties (active, mode_id, vrr_enabled).
@@ -1673,5 +1792,139 @@ impl<'a> AtomicRequest<'a> {
         }
 
         Ok(req)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use std::{collections::HashMap, num::NonZeroU32};
+
+    use drm::control::{connector, crtc, framebuffer, plane, property};
+
+    use crate::{
+        backend::drm::surface::atomic::to_fixed,
+        utils::{Physical, Rectangle},
+    };
+
+    use super::{AtomicDrmSurface, AtomicRequest, ColorValues, PlaneConfig, PlaneState, PropMapping};
+
+    fn is_send<S: Send>() {}
+
+    #[test]
+    fn surface_is_send() {
+        is_send::<AtomicDrmSurface>();
+    }
+
+    #[test]
+    fn test_fixed_point() {
+        let geometry: Rectangle<f64, Physical> = Rectangle::from_size((1920.0, 1080.0).into());
+        let fixed = to_fixed(geometry.size.w) as u64;
+        assert_eq!(125829120, fixed);
+    }
+
+    #[test]
+    fn test_fractional_fixed_point() {
+        let geometry: Rectangle<f64, Physical> = Rectangle::from_size((1920.1, 1080.0).into());
+        let fixed = to_fixed(geometry.size.w) as u64;
+        assert_eq!(125835674, fixed);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn color_properties_share_the_framebuffer_and_mode_request() {
+        let conn: connector::Handle = NonZeroU32::new(1).unwrap().into();
+        let crtc: crtc::Handle = NonZeroU32::new(2).unwrap().into();
+        let plane: plane::Handle = NonZeroU32::new(3).unwrap().into();
+        let fb: framebuffer::Handle = NonZeroU32::new(4).unwrap().into();
+        let props = |names: &[&str]| {
+            names
+                .iter()
+                .enumerate()
+                .map(|(i, name)| {
+                    (
+                        name.to_string(),
+                        property::Handle::from(NonZeroU32::new(100 + i as u32).unwrap()),
+                    )
+                })
+                .collect::<HashMap<_, _>>()
+        };
+        let mapping = PropMapping {
+            connectors: HashMap::from([(
+                conn,
+                props(&["CRTC_ID", "HDR_OUTPUT_METADATA", "Colorspace", "max bpc"]),
+            )]),
+            crtcs: HashMap::from([(crtc, props(&["ACTIVE", "MODE_ID"]))]),
+            planes: HashMap::from([(
+                plane,
+                props(&[
+                    "CRTC_ID", "FB_ID", "SRC_X", "SRC_Y", "SRC_W", "SRC_H", "CRTC_X", "CRTC_Y", "CRTC_W",
+                    "CRTC_H",
+                ]),
+            )]),
+        };
+        let mut request = AtomicRequest::new(&mapping);
+        request.set_connector(conn, crtc).unwrap();
+        request
+            .set_crtc(crtc, Some(property::Value::Blob(200)), false)
+            .unwrap();
+        request
+            .set_connector_color(
+                conn,
+                ColorValues {
+                    hdr_metadata: Some(201),
+                    colorspace: Some(42),
+                    max_bpc: Some(10),
+                },
+            )
+            .unwrap();
+        request
+            .set_plane(
+                crtc,
+                &PlaneState {
+                    handle: plane,
+                    config: Some(PlaneConfig {
+                        src: Rectangle::from_size((1920, 1080).into()).to_f64(),
+                        dst: Rectangle::from_size((1920, 1080).into()),
+                        transform: crate::utils::Transform::Normal,
+                        alpha: 1.0,
+                        damage_clips: None,
+                        fb,
+                        fence: None,
+                    }),
+                },
+            )
+            .unwrap();
+        let raw = |value: property::Value<'_>| u64::from(value);
+        assert_eq!(raw(request.connector_props[&conn]["HDR_OUTPUT_METADATA"]), 201);
+        assert_eq!(raw(request.connector_props[&conn]["Colorspace"]), 42);
+        assert_eq!(raw(request.connector_props[&conn]["max bpc"]), 10);
+        assert_eq!(raw(request.crtc_props[&crtc]["MODE_ID"]), 200);
+        assert_eq!(raw(request.plane_props[&plane]["FB_ID"]), 4);
+        assert!(request.build().is_ok());
+    }
+
+    #[test]
+    fn missing_color_property_fails_without_issuing_a_commit() {
+        let conn: connector::Handle = NonZeroU32::new(1).unwrap().into();
+        let mapping = PropMapping {
+            connectors: HashMap::from([(conn, HashMap::new())]),
+            crtcs: HashMap::new(),
+            planes: HashMap::new(),
+        };
+        let mut request = AtomicRequest::new(&mapping);
+        assert!(matches!(
+            request.set_connector_color(
+                conn,
+                ColorValues {
+                    hdr_metadata: Some(3),
+                    ..Default::default()
+                }
+            ),
+            Err(super::Error::UnknownProperty {
+                name: "HDR_OUTPUT_METADATA",
+                ..
+            })
+        ));
+        assert!(request.set_connector_color(conn, ColorValues::default()).is_ok());
     }
 }

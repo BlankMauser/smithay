@@ -83,6 +83,14 @@ pub enum Error {
         /// Property name
         name: &'static str,
     },
+    /// The requested connector color state is invalid or unsupported.
+    #[error("Invalid color state for connector ({connector:?}): {reason}")]
+    InvalidColorState {
+        /// Connector whose state was rejected.
+        connector: connector::Handle,
+        /// Reason the state could not be staged.
+        reason: &'static str,
+    },
     /// Atomic Test failed for new properties
     #[error("Atomic Test failed for new properties on crtc ({0:?})")]
     TestFailed(crtc::Handle),

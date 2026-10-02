@@ -9,6 +9,7 @@ use drm::control::{Device as ControlDevice, Mode, connector, crtc, framebuffer, 
 use libc::dev_t;
 
 pub(super) mod atomic;
+mod color;
 #[cfg(feature = "backend_gbm")]
 pub(super) mod gbm;
 pub(super) mod legacy;
@@ -19,6 +20,7 @@ use super::{
 use crate::utils::DevPath;
 use crate::utils::{Buffer, Physical, Point, Rectangle, Transform};
 use atomic::AtomicDrmSurface;
+pub use color::{ColorSpace, ConnectorColorCapabilities, ConnectorColorState, HdrEotf, HdrMetadata};
 use legacy::LegacyDrmSurface;
 
 /// An open crtc + plane combination that can be used for scan-out
@@ -189,6 +191,76 @@ impl BasicDevice for DrmSurface {}
 impl ControlDevice for DrmSurface {}
 
 impl DrmSurface {
+    /// Returns driver color-property support for a connector attached to this surface.
+    ///
+    /// EDID support and the framebuffer's pixel encoding must be checked separately.
+    /// Legacy DRM reports no color properties.
+    pub fn color_capabilities(&self, conn: connector::Handle) -> Result<ConnectorColorCapabilities, Error> {
+        match &*self.internal {
+            DrmSurfaceInternal::Atomic(surf) => surf.color_capabilities(conn),
+            DrmSurfaceInternal::Legacy(_) => {
+                if !self
+                    .pending_connectors()
+                    .into_iter()
+                    .any(|candidate| candidate == conn)
+                {
+                    return Err(Error::UnknownConnector(conn));
+                }
+                Ok(ConnectorColorCapabilities::default())
+            }
+        }
+    }
+
+    /// Stages connector color state for the next atomic framebuffer commit.
+    ///
+    /// No display properties change until [`commit`](Self::commit) succeeds. Validate
+    /// the staged state with [`test_state`](Self::test_state) using the intended
+    /// framebuffer, whose encoding must match this state. Failed tests and commits
+    /// preserve the committed state; callers can stage its previous value to roll back.
+    /// The default state clears HDR metadata and restores the default colorspace.
+    /// Legacy DRM accepts only the default state as a no-op.
+    pub fn set_color_state(&self, conn: connector::Handle, state: ConnectorColorState) -> Result<(), Error> {
+        match &*self.internal {
+            DrmSurfaceInternal::Atomic(surf) => surf.set_color_state(conn, state),
+            DrmSurfaceInternal::Legacy(_) => {
+                if !self
+                    .pending_connectors()
+                    .into_iter()
+                    .any(|candidate| candidate == conn)
+                {
+                    return Err(Error::UnknownConnector(conn));
+                }
+                if state == ConnectorColorState::default() {
+                    Ok(())
+                } else {
+                    Err(Error::InvalidColorState {
+                        connector: conn,
+                        reason: "connector color state requires atomic DRM",
+                    })
+                }
+            }
+        }
+    }
+
+    /// Returns color state staged by this surface for an attached connector.
+    pub fn pending_color_state(&self, conn: connector::Handle) -> Option<ConnectorColorState> {
+        match &*self.internal {
+            DrmSurfaceInternal::Atomic(surf) => surf.pending_color_state(conn),
+            DrmSurfaceInternal::Legacy(_) => None,
+        }
+    }
+
+    /// Returns the last successfully committed color state known to this surface.
+    ///
+    /// `None` means no state has been committed yet, the connector is not attached,
+    /// or the state was reset from hardware, for example after a session resume.
+    pub fn current_color_state(&self, conn: connector::Handle) -> Option<ConnectorColorState> {
+        match &*self.internal {
+            DrmSurfaceInternal::Atomic(surf) => surf.current_color_state(conn),
+            DrmSurfaceInternal::Legacy(_) => None,
+        }
+    }
+
     /// Returns the underlying [`DrmDeviceFd`]
     pub fn device_fd(&self) -> &DrmDeviceFd {
         match &*self.internal {
