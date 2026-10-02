@@ -812,7 +812,9 @@ impl AtomicDrmSurface {
     }
 
     pub fn commit_pending(&self) -> bool {
-        *self.pending.read().unwrap() != *self.state.read().unwrap()
+        let current = self.state.read().unwrap();
+        let pending = self.pending.read().unwrap();
+        *pending != *current
     }
 
     #[instrument(level = "trace", parent = &self.span, skip(self, planes))]

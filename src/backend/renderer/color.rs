@@ -113,8 +113,13 @@ impl ColorTransform {
     /// source. Extended linear, PQ and HLG sources retain absolute luminance.
     pub fn for_source(self, mut source: Self) -> Self {
         if !matches!(source.transfer, 0 | 5 | 11 | 13) {
-            source.luminance_scale *=
-                self.luminance_scale * self.reference_luminance * 80.0 / source.reference_luminance.max(1e-6);
+            let range = source.reference_luminance - source.min_luminance;
+            let relative = (self.reference_luminance - self.min_luminance) / range.max(1e-6);
+            source.max_luminance =
+                self.min_luminance + (source.max_luminance - source.min_luminance) * relative;
+            source.min_luminance = self.min_luminance;
+            source.reference_luminance = self.reference_luminance;
+            source.luminance_scale = self.luminance_scale;
             let matrix = source.matrix;
             source.matrix = std::array::from_fn(|index| {
                 let row = index % 3;
@@ -222,5 +227,45 @@ fn decode(transfer: u32, value: f32) -> f32 {
             }
         }
         _ => value,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ColorTransform;
+
+    #[test]
+    fn relative_sdr_maps_black_and_reference_without_changing_absolute_sources() {
+        let output = ColorTransform {
+            transfer: 9,
+            min_luminance: 0.005,
+            max_luminance: 203.,
+            reference_luminance: 203.,
+            luminance_scale: 1. / 80.,
+            ..ColorTransform::IDENTITY
+        };
+        let source = ColorTransform {
+            min_luminance: 0.2,
+            max_luminance: 80.,
+            reference_luminance: 80.,
+            ..output
+        };
+        let adapted = output.for_source(source);
+        for (pixel, nits) in [(0., 0.005), (1., 203.)] {
+            let result = adapted.apply([pixel, pixel, pixel, 1.]);
+            assert!((result[0] * 80. - nits).abs() < 1e-4);
+            assert_eq!(result, output.apply([pixel, pixel, pixel, 1.]));
+        }
+        let extended = output.for_source(ColorTransform {
+            max_luminance: 159.8,
+            ..source
+        });
+        assert!((extended.max_luminance - 405.995).abs() < 1e-4);
+        for transfer in [0, 5, 11, 13] {
+            let absolute = ColorTransform { transfer, ..source };
+            assert_eq!(output.for_source(absolute), absolute);
+        }
+        // Reference white is CPU metadata; the fixed GPU payload stays five vec4s.
+        assert_eq!(std::mem::size_of_val(&adapted.to_uniforms()), 80);
     }
 }
