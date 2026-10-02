@@ -1,0 +1,22 @@
+src/backend/renderer/color.rs
+  s_b6e38a31c8304e::t_4a5c5897b6d2bc 232-271
+  s_b6e38a31c8304e::t_b1687e75f7e94c 116-122
+src/backend/drm/surface/atomic.rs
+  s_b6e38a31c8304e::t_495b8e02a45511 815-817
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "58d2701d517019ffbe20e2a0afc15cd0768578ae",
+  "prompts": {},
+  "sessions": {
+    "s_b6e38a31c8304e": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0fa77-7897-7020-956c-37d98d483eec",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "BlankMauser <thomasluvan@gmail.com>"
+    }
+  }
+}
