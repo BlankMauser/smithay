@@ -1,0 +1,25 @@
+src/backend/renderer/gles/mod.rs
+  s_b6e38a31c8304e::t_c415febbe226ac 1497,1521
+  s_b6e38a31c8304e::t_17de76c2198022 63,2004
+  s_b6e38a31c8304e::t_742fae123c059d 1146,1984-1995,1998-2003,2005-2078
+  s_b6e38a31c8304e::t_c0127a4fc07510 1996-1997,2079
+  s_b6e38a31c8304e::t_cdc8ff4337f155 2080
+src/backend/renderer/wgpu/mod.rs
+  s_b6e38a31c8304e::t_2051c432cc0c1d 1248-1251,1253,1255-1257,1260,1265,1294-1312,1327,1338-1392
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "955ef92ef5835a5348ff909e8ec3ae4314fa51cb",
+  "prompts": {},
+  "sessions": {
+    "s_b6e38a31c8304e": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0fa77-7897-7020-956c-37d98d483eec",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "BlankMauser <thomasluvan@gmail.com>"
+    }
+  }
+}
