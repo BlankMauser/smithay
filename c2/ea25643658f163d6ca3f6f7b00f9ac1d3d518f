@@ -1,0 +1,64 @@
+Cargo.toml
+  s_b6e38a31c8304e::t_e4e5abd995ef80 68
+src/backend/renderer/gles/mod.rs
+  s_b6e38a31c8304e::t_c0127a4fc07510 6,391,442,759,951,1122,1264,1319,1538-1550,2035-2044,2091-2093,2131-2133,2352,2354,2474-2480,2680-2683,2807-2859,3107
+  s_b6e38a31c8304e::t_a7177ab95841a0 3108-3113,3300-3304,3789-3791
+src/backend/drm/error.rs
+  s_b6e38a31c8304e::t_711257b9d6431b 94-101
+src/backend/drm/surface/atomic.rs
+  s_b6e38a31c8304e::t_db0b4724553c8a 36,47,58,162,171,232,317-330,454,524,597,653,780,854,888,927,980-982,1017,1160-1165,1177,1766-1781,1807,1813,1844-1846,1914,1955,1961
+src/backend/drm/surface/color.rs
+  s_b6e38a31c8304e::t_10ed124dc066da 3,5,154,159,165-256,263,409,661-673
+src/backend/drm/surface/mod.rs
+  s_b6e38a31c8304e::t_d486784f0423df 194-216
+src/backend/renderer/color.rs
+  s_b6e38a31c8304e::t_1d74ffbca3de9f 1,79-226
+src/backend/renderer/element/surface.rs
+  s_b6e38a31c8304e::t_bf801b029df8ac 65,230-234,250,285,292-299,337,347-351,481-485,496-498
+src/backend/renderer/gles/color_tests.rs
+  s_b6e38a31c8304e::t_2799a142effbf5 1-201
+src/backend/renderer/gles/shaders/color.frag
+  s_b6e38a31c8304e::t_3740df7ac88ea0 1-44
+src/backend/renderer/gles/shaders/implicit/mod.rs
+  s_b6e38a31c8304e::t_9394c98b186ab0 12,107
+src/backend/renderer/gles/shaders/mod.rs
+  s_b6e38a31c8304e::t_8f85c8f484977e 79-81,158,185
+src/backend/renderer/gles/texture.rs
+  s_b6e38a31c8304e::t_b154ca01609141 31,44-52,135
+src/backend/renderer/mod.rs
+  s_b6e38a31c8304e::t_106a96d8a3d74a 39-40,282-291
+src/backend/renderer/utils/wayland.rs
+  s_b6e38a31c8304e::t_b986a4a48fa734 284-291
+src/backend/renderer/wgpu/color.wgsl
+  s_b6e38a31c8304e::t_59b48fb04c0730 1-66
+src/backend/renderer/wgpu/custom.rs
+  s_b6e38a31c8304e::t_ac797d6c0e247b 11,14-26,68-74,80,110-114,161-164,202-312
+src/backend/renderer/wgpu/frame.rs
+  s_b6e38a31c8304e::t_a470efb8a6d27c 10-12,17-26,40,45-59,91-93,102,172-186,191-193,197,205,229-257,271,286,309,322,361,525-527,533,559,577-584,623
+src/backend/renderer/wgpu/mod.rs
+  s_b6e38a31c8304e::t_c4c999803ed2d3 19-20,51-52,72-73,131-148,160,165,229,242,293-302,304-314,397-399,423,451-460,538,584,686-693,742-754,776-777,783-787,794,800-806,808,814,816,1061-1062,1114-1115,1509
+src/backend/renderer/wgpu/shaders.wgsl
+  s_b6e38a31c8304e::t_1f5bfba6483f4a 37,44-47
+src/backend/renderer/wgpu/tests.rs
+  s_b6e38a31c8304e::t_bf739fb724ace8 1-198
+src/backend/renderer/wgpu/texture.rs
+  s_b6e38a31c8304e::t_9604d635e2cbe0 3-6,22,32,38-44,50,63,152,173-182
+src/backend/renderer/wgpu/vulkan.rs
+  s_b6e38a31c8304e::t_df693e37e2b43a 365-372,601-604,612-613
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "c2ea25643658f163d6ca3f6f7b00f9ac1d3d518f",
+  "prompts": {},
+  "sessions": {
+    "s_b6e38a31c8304e": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0fa77-7897-7020-956c-37d98d483eec",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "BlankMauser <thomasluvan@gmail.com>"
+    }
+  }
+}
