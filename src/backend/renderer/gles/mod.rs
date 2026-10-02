@@ -60,7 +60,7 @@ use crate::{
             ffi::egl::{self as ffi_egl, types::EGLImage},
         },
     },
-    utils::{Buffer as BufferCoord, Physical, Rectangle, Size, Transform},
+    utils::{Buffer as BufferCoord, Physical, Point, Rectangle, Size, Transform},
 };
 
 #[cfg(all(feature = "wayland_frontend", feature = "use_system_lib"))]
@@ -1143,58 +1143,7 @@ impl ImportMem for GlesRenderer {
         data: &[u8],
         region: Rectangle<i32, BufferCoord>,
     ) -> Result<(), Self::Error> {
-        if texture.0.format.is_none() {
-            return Err(GlesError::UnknownPixelFormat);
-        }
-        if texture.0.is_external {
-            return Err(GlesError::UnsupportedPixelLayout);
-        }
-        let (read_format, type_) = gl_read_for_internal(texture.0.format.expect("We check that before"))
-            .ok_or(GlesError::UnknownPixelFormat)?;
-
-        if data.len()
-            < (region.size.w * region.size.h) as usize
-                * (gl_bpp(read_format, type_).ok_or(GlesError::UnknownPixelFormat)? / 8)
-        {
-            return Err(GlesError::UnexpectedSize);
-        }
-
-        let mut sync_lock = texture.0.sync.write().unwrap();
-        unsafe {
-            self.egl.make_current()?;
-            sync_lock.wait_for_all(&self.gl);
-            self.gl.BindTexture(ffi::TEXTURE_2D, texture.0.texture);
-            self.gl
-                .TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_WRAP_S, ffi::CLAMP_TO_EDGE as i32);
-            self.gl
-                .TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_WRAP_T, ffi::CLAMP_TO_EDGE as i32);
-            self.gl.PixelStorei(ffi::UNPACK_ROW_LENGTH, texture.0.size.w);
-            self.gl.PixelStorei(ffi::UNPACK_SKIP_PIXELS, region.loc.x);
-            self.gl.PixelStorei(ffi::UNPACK_SKIP_ROWS, region.loc.y);
-            self.gl.TexSubImage2D(
-                ffi::TEXTURE_2D,
-                0,
-                region.loc.x,
-                region.loc.y,
-                region.size.w,
-                region.size.h,
-                read_format,
-                type_,
-                data.as_ptr() as *const _,
-            );
-            self.gl.PixelStorei(ffi::UNPACK_ROW_LENGTH, 0);
-            self.gl.PixelStorei(ffi::UNPACK_SKIP_PIXELS, 0);
-            self.gl.PixelStorei(ffi::UNPACK_SKIP_ROWS, 0);
-            self.gl.BindTexture(ffi::TEXTURE_2D, 0);
-
-            if self.capabilities.contains(&Capability::Fencing) {
-                sync_lock.update_write(&self.gl);
-            } else if self.egl.is_shared() {
-                self.gl.Finish();
-            }
-        }
-
-        Ok(())
+        self.update_memory_from(texture, data, region, texture.0.size, region.loc)
     }
 
     fn mem_formats(&self) -> Box<dyn Iterator<Item = Fourcc>> {
@@ -1545,7 +1494,7 @@ impl ExportMem for GlesRenderer {
                     .ok()
                     .and_then(|height| width.checked_mul(height))
             })
-            .and_then(|pixels| pixels.checked_mul(bytes as usize))
+            .and_then(|pixels| pixels.checked_mul(bytes))
             .filter(|len| *len <= isize::MAX as usize)
             .ok_or(GlesError::UnknownSize)?;
 
@@ -1569,7 +1518,7 @@ impl ExportMem for GlesRenderer {
             mapping_ptr
         };
 
-        unsafe { Ok(slice::from_raw_parts(ptr as *const u8, len as usize)) }
+        unsafe { Ok(slice::from_raw_parts(ptr as *const u8, len)) }
     }
 }
 
@@ -2030,6 +1979,103 @@ impl GlesRenderer {
         self.profiler.sync_gpu(&self.gl);
 
         Ok(result)
+    }
+
+    /// Update a destination region from tightly packed pixels in the texture's format.
+    ///
+    /// Unlike [`ImportMem::update_memory`], `data` starts at the region's first pixel
+    /// and contains only `region.size.w * region.size.h` pixels. Invalid bounds and
+    /// truncated buffers are rejected before accessing GL.
+    pub fn update_memory_region(
+        &mut self,
+        texture: &GlesTexture,
+        data: &[u8],
+        region: Rectangle<i32, BufferCoord>,
+    ) -> Result<(), GlesError> {
+        self.update_memory_from(texture, data, region, region.size, (0, 0).into())
+    }
+
+    fn update_memory_from(
+        &mut self,
+        texture: &GlesTexture,
+        data: &[u8],
+        region: Rectangle<i32, BufferCoord>,
+        source_size: Size<i32, BufferCoord>,
+        source_offset: Point<i32, BufferCoord>,
+    ) -> Result<(), GlesError> {
+        if texture.0.format.is_none() {
+            return Err(GlesError::UnknownPixelFormat);
+        }
+        if texture.0.is_external {
+            return Err(GlesError::UnsupportedPixelLayout);
+        }
+        let (read_format, type_) = gl_read_for_internal(texture.0.format.expect("We check that before"))
+            .ok_or(GlesError::UnknownPixelFormat)?;
+
+        let right = region.loc.x.checked_add(region.size.w);
+        let bottom = region.loc.y.checked_add(region.size.h);
+        if region.loc.x < 0
+            || region.loc.y < 0
+            || region.size.w <= 0
+            || region.size.h <= 0
+            || right.is_none_or(|right| right > texture.0.size.w)
+            || bottom.is_none_or(|bottom| bottom > texture.0.size.h)
+        {
+            return Err(GlesError::UnexpectedSize);
+        }
+        let bytes_per_pixel = gl_bpp(read_format, type_).ok_or(GlesError::UnknownPixelFormat)? / 8;
+        let expected = usize::try_from(source_size.w)
+            .ok()
+            .and_then(|width| {
+                usize::try_from(source_size.h)
+                    .ok()
+                    .and_then(|height| width.checked_mul(height))
+            })
+            .and_then(|pixels| pixels.checked_mul(bytes_per_pixel))
+            .filter(|bytes| *bytes <= isize::MAX as usize)
+            .ok_or(GlesError::UnexpectedSize)?;
+        if data.len() < expected {
+            return Err(GlesError::UnexpectedSize);
+        }
+
+        let mut sync_lock = texture.0.sync.write().unwrap();
+        unsafe {
+            self.egl.make_current()?;
+            sync_lock.wait_for_all(&self.gl);
+            self.gl.BindTexture(ffi::TEXTURE_2D, texture.0.texture);
+            self.gl
+                .TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_WRAP_S, ffi::CLAMP_TO_EDGE as i32);
+            self.gl
+                .TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_WRAP_T, ffi::CLAMP_TO_EDGE as i32);
+            self.gl.PixelStorei(ffi::UNPACK_ALIGNMENT, 1);
+            self.gl.PixelStorei(ffi::UNPACK_ROW_LENGTH, source_size.w);
+            self.gl.PixelStorei(ffi::UNPACK_SKIP_PIXELS, source_offset.x);
+            self.gl.PixelStorei(ffi::UNPACK_SKIP_ROWS, source_offset.y);
+            self.gl.TexSubImage2D(
+                ffi::TEXTURE_2D,
+                0,
+                region.loc.x,
+                region.loc.y,
+                region.size.w,
+                region.size.h,
+                read_format,
+                type_,
+                data.as_ptr() as *const _,
+            );
+            self.gl.PixelStorei(ffi::UNPACK_ALIGNMENT, 4);
+            self.gl.PixelStorei(ffi::UNPACK_ROW_LENGTH, 0);
+            self.gl.PixelStorei(ffi::UNPACK_SKIP_PIXELS, 0);
+            self.gl.PixelStorei(ffi::UNPACK_SKIP_ROWS, 0);
+            self.gl.BindTexture(ffi::TEXTURE_2D, 0);
+
+            if self.capabilities.contains(&Capability::Fencing) {
+                sync_lock.update_write(&self.gl);
+            } else if self.egl.is_shared() {
+                self.gl.Finish();
+            }
+        }
+
+        Ok(())
     }
 
     /// Input transform inherited by new frames, including damage-tracked offscreen passes.

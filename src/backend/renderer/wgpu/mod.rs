@@ -1245,6 +1245,98 @@ impl Offscreen<WgpuTexture> for WgpuRenderer {
     }
 }
 
+impl WgpuRenderer {
+    /// Update a texture rectangle from tightly packed pixels starting at `data[0]`.
+    /// Unlike [`ImportMem::update_memory`], the source contains only `region.size`.
+    pub fn update_memory_region(
+        &mut self,
+        texture: &WgpuTexture,
+        data: &[u8],
+        region: Rectangle<i32, Buffer>,
+    ) -> Result<(), WgpuError> {
+        self.write_memory(texture, data, region, true)
+    }
+
+    fn write_memory(
+        &mut self,
+        texture: &WgpuTexture,
+        data: &[u8],
+        region: Rectangle<i32, Buffer>,
+        packed: bool,
+    ) -> Result<(), WgpuError> {
+        if texture.context_id() != &self.context_id {
+            return Err(WgpuError::ForeignTexture);
+        }
+        if !texture.raw().usage().contains(::wgpu::TextureUsages::COPY_DST) {
+            return Err(WgpuError::UnsupportedTextureUsage);
+        }
+        let size = texture.size();
+        let bytes_per_pixel = texture::bytes_per_pixel(texture.format().unwrap())?;
+        let right = region
+            .loc
+            .x
+            .checked_add(region.size.w)
+            .ok_or(WgpuError::InvalidRegion)?;
+        let bottom = region
+            .loc
+            .y
+            .checked_add(region.size.h)
+            .ok_or(WgpuError::InvalidRegion)?;
+        if region.loc.x < 0
+            || region.loc.y < 0
+            || region.size.w <= 0
+            || region.size.h <= 0
+            || right > size.w
+            || bottom > size.h
+        {
+            return Err(WgpuError::InvalidRegion);
+        }
+        let source_size = if packed { region.size } else { size };
+        let source_stride = (source_size.w as usize)
+            .checked_mul(bytes_per_pixel)
+            .ok_or(WgpuError::InvalidRegion)?;
+        let expected = source_stride
+            .checked_mul(source_size.h as usize)
+            .ok_or(WgpuError::InvalidRegion)?;
+        if data.len() < expected {
+            return Err(WgpuError::IncompleteBuffer {
+                expected,
+                actual: data.len(),
+            });
+        }
+        let offset = if packed {
+            0
+        } else {
+            region.loc.y as usize * source_stride + region.loc.x as usize * bytes_per_pixel
+        };
+        let source_stride = u32::try_from(source_stride).map_err(|_| WgpuError::InvalidRegion)?;
+        self.queue.write_texture(
+            ::wgpu::TexelCopyTextureInfo {
+                texture: texture.raw(),
+                mip_level: 0,
+                origin: ::wgpu::Origin3d {
+                    x: region.loc.x as u32,
+                    y: region.loc.y as u32,
+                    z: 0,
+                },
+                aspect: ::wgpu::TextureAspect::All,
+            },
+            data,
+            ::wgpu::TexelCopyBufferLayout {
+                offset: offset as u64,
+                bytes_per_row: Some(source_stride),
+                rows_per_image: Some(region.size.h as u32),
+            },
+            ::wgpu::Extent3d {
+                width: region.size.w as u32,
+                height: region.size.h as u32,
+                depth_or_array_layers: 1,
+            },
+        );
+        Ok(())
+    }
+}
+
 impl ImportMem for WgpuRenderer {
     fn import_memory(
         &mut self,
@@ -1296,66 +1388,7 @@ impl ImportMem for WgpuRenderer {
         data: &[u8],
         region: Rectangle<i32, Buffer>,
     ) -> Result<(), WgpuError> {
-        if texture.context_id() != &self.context_id {
-            return Err(WgpuError::ForeignTexture);
-        }
-        if !texture.raw().usage().contains(::wgpu::TextureUsages::COPY_DST) {
-            return Err(WgpuError::UnsupportedTextureUsage);
-        }
-        let size = texture.size();
-        let bytes_per_pixel = texture::bytes_per_pixel(texture.format().unwrap())?;
-        let expected = size.w as usize * size.h as usize * bytes_per_pixel;
-        if data.len() < expected {
-            return Err(WgpuError::IncompleteBuffer {
-                expected,
-                actual: data.len(),
-            });
-        }
-        let right = region
-            .loc
-            .x
-            .checked_add(region.size.w)
-            .ok_or(WgpuError::InvalidRegion)?;
-        let bottom = region
-            .loc
-            .y
-            .checked_add(region.size.h)
-            .ok_or(WgpuError::InvalidRegion)?;
-        if region.loc.x < 0
-            || region.loc.y < 0
-            || region.size.w <= 0
-            || region.size.h <= 0
-            || right > size.w
-            || bottom > size.h
-        {
-            return Err(WgpuError::InvalidRegion);
-        }
-        let source_stride = size.w as usize * bytes_per_pixel;
-        let offset = region.loc.y as usize * source_stride + region.loc.x as usize * bytes_per_pixel;
-        self.queue.write_texture(
-            ::wgpu::TexelCopyTextureInfo {
-                texture: texture.raw(),
-                mip_level: 0,
-                origin: ::wgpu::Origin3d {
-                    x: region.loc.x as u32,
-                    y: region.loc.y as u32,
-                    z: 0,
-                },
-                aspect: ::wgpu::TextureAspect::All,
-            },
-            data,
-            ::wgpu::TexelCopyBufferLayout {
-                offset: offset as u64,
-                bytes_per_row: Some(source_stride as u32),
-                rows_per_image: Some(region.size.h as u32),
-            },
-            ::wgpu::Extent3d {
-                width: region.size.w as u32,
-                height: region.size.h as u32,
-                depth_or_array_layers: 1,
-            },
-        );
-        Ok(())
+        self.write_memory(texture, data, region, false)
     }
 
     fn mem_formats(&self) -> Box<dyn Iterator<Item = DrmFourcc>> {
