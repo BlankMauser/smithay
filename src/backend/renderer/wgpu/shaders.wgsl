@@ -34,10 +34,14 @@ fn texture_fragment(input: VertexOutput) -> @location(0) vec4<f32> {
     if input.force_opaque > 0.5 {
         color.a = 1.0;
     }
-    return color * input.color;
+    return smithay_color_transform(color * input.color);
 }
 
 @fragment
 fn solid_fragment(input: VertexOutput) -> @location(0) vec4<f32> {
     return input.color;
 }
+
+// Optional auxiliary image, for example a flattened monitor color LUT.
+@group(2) @binding(0) var auxiliary_texture: texture_2d<f32>;
+@group(2) @binding(1) var auxiliary_sampler: sampler;

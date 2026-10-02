@@ -7,11 +7,23 @@ use super::{
     WgpuTexture, texture::has_alpha,
 };
 use crate::{
-    backend::renderer::{Blit, BlitFrame, Color32F, ContextId, DebugFlags, Frame, Texture, TextureFilter},
+    backend::renderer::{
+        Blit, BlitFrame, Color32F, ColorTransform, ContextId, DebugFlags, Frame, Texture, TextureFilter,
+    },
     utils::{Buffer, Physical, Point, Rectangle, Size, Transform},
 };
 
 impl WgpuFrame<'_, '_> {
+    /// Current input transform, independent of the output geometry transform.
+    pub fn color_transform(&self) -> Option<ColorTransform> {
+        self.color_transform
+    }
+
+    /// Change the input transform for subsequent draws, returning the old value.
+    pub fn set_color_transform(&mut self, color: Option<ColorTransform>) -> Option<ColorTransform> {
+        mem::replace(&mut self.color_transform, color)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn render_texture(
         &mut self,
@@ -25,9 +37,25 @@ impl WgpuFrame<'_, '_> {
         program: Option<&WgpuTexProgram>,
         additional_uniforms: &[Uniform<'_>],
         blend: bool,
+        auxiliary: Option<&WgpuTexture>,
     ) -> Result<(), WgpuError> {
         if texture.context_id() != &self.renderer.context_id {
             return Err(WgpuError::ForeignTexture);
+        }
+        if let Some(auxiliary) = auxiliary {
+            if auxiliary.context_id() != &self.renderer.context_id {
+                return Err(WgpuError::ForeignTexture);
+            }
+            if auxiliary.same_storage(&self.target.texture) {
+                return Err(WgpuError::Unsupported);
+            }
+            if !auxiliary
+                .raw()
+                .usage()
+                .contains(::wgpu::TextureUsages::TEXTURE_BINDING)
+            {
+                return Err(WgpuError::UnsupportedTextureUsage);
+            }
         }
         if texture.same_storage(&self.target.texture) {
             return Err(WgpuError::Unsupported);
@@ -60,6 +88,9 @@ impl WgpuFrame<'_, '_> {
         if let Some(program) = program {
             program.0.check_context(self.renderer)?;
         }
+        let color = (!blit && !texture.is_linear())
+            .then_some(self.color_transform)
+            .flatten();
         let custom_uniforms = program
             .map(|program| {
                 let target_size = self.transform.transform_size(self.output_size);
@@ -68,6 +99,7 @@ impl WgpuFrame<'_, '_> {
                     alpha,
                     self.renderer.debug_flags.contains(DebugFlags::TINT),
                     additional_uniforms,
+                    color,
                 )
             })
             .transpose()?;
@@ -137,18 +169,32 @@ impl WgpuFrame<'_, '_> {
         }
         let end = self.vertices.len() as u32;
         if start != end {
-            let kind = if let Some(program) = program {
-                let uniform_offset = match self.renderer.push_uniform_data(custom_uniforms.as_ref().unwrap())
-                {
-                    Ok(offset) => offset,
+            let mut uniform_data = custom_uniforms.unwrap_or([0.0; super::custom::TOTAL_UNIFORM_SLOTS * 4]);
+            super::custom::set_color_uniforms(&mut uniform_data, color);
+            let cached = self
+                .texture_uniform
+                .filter(|(cached, _)| program.is_none() && *cached == color);
+            let uniform_offset = if let Some((_, offset)) = cached {
+                offset
+            } else {
+                match self.renderer.push_uniform_data(&uniform_data) {
+                    Ok(offset) => {
+                        if program.is_none() {
+                            self.texture_uniform = Some((color, offset));
+                        }
+                        offset
+                    }
                     Err(error) => {
                         self.vertices.truncate(start as usize);
                         return Err(error);
                     }
-                };
+                }
+            };
+            let kind = if let Some(program) = program {
                 DrawKind::CustomTexture {
                     texture: texture.clone(),
                     program: program.clone(),
+                    auxiliary: auxiliary.cloned(),
                     blend,
                     uniform_offset,
                 }
@@ -156,6 +202,7 @@ impl WgpuFrame<'_, '_> {
                 DrawKind::Texture {
                     texture: texture.clone(),
                     opaque: blit || (!has_alpha(texture.format().unwrap()) && alpha == 1.0),
+                    uniform_offset,
                 }
             };
             self.draws.push(Draw {
@@ -180,6 +227,35 @@ impl WgpuFrame<'_, '_> {
         program: Option<&WgpuTexProgram>,
         additional_uniforms: &[Uniform<'_>],
     ) -> Result<(), WgpuError> {
+        self.render_texture_from_to_with_auxiliary(
+            texture,
+            src,
+            dst,
+            damage,
+            opaque_regions,
+            src_transform,
+            alpha,
+            program,
+            additional_uniforms,
+            None,
+        )
+    }
+
+    /// Renders a texture with an optional secondary texture available at group 2.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_texture_from_to_with_auxiliary(
+        &mut self,
+        texture: &WgpuTexture,
+        src: Rectangle<f64, Buffer>,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        opaque_regions: &[Rectangle<i32, Physical>],
+        src_transform: Transform,
+        alpha: f32,
+        program: Option<&WgpuTexProgram>,
+        additional_uniforms: &[Uniform<'_>],
+        auxiliary: Option<&WgpuTexture>,
+    ) -> Result<(), WgpuError> {
         let Some(program) = program else {
             return self.render_texture(
                 texture,
@@ -192,6 +268,7 @@ impl WgpuFrame<'_, '_> {
                 None,
                 &[],
                 true,
+                auxiliary,
             );
         };
         if alpha != 1.0 || opaque_regions.is_empty() {
@@ -206,6 +283,7 @@ impl WgpuFrame<'_, '_> {
                 Some(program),
                 additional_uniforms,
                 true,
+                auxiliary,
             );
         }
 
@@ -228,6 +306,7 @@ impl WgpuFrame<'_, '_> {
             Some(program),
             additional_uniforms,
             true,
+            auxiliary,
         );
         let opaque_result = self.render_texture(
             texture,
@@ -240,6 +319,7 @@ impl WgpuFrame<'_, '_> {
             Some(program),
             additional_uniforms,
             false,
+            auxiliary,
         );
         self.renderer.non_opaque_damage = non_opaque;
         self.renderer.opaque_damage = opaque;
@@ -278,6 +358,7 @@ impl WgpuFrame<'_, '_> {
             alpha,
             self.renderer.debug_flags.contains(DebugFlags::TINT),
             additional_uniforms,
+            self.color_transform,
         )?;
 
         let scale = src.size.to_f64() / dst.size.to_f64();
@@ -441,12 +522,15 @@ impl WgpuFrame<'_, '_> {
         color: Color32F,
         replace: bool,
     ) -> Result<(), WgpuError> {
+        let color = self.color_transform.map_or(color.components(), |transform| {
+            transform.apply(color.components())
+        });
         let start = self.vertices.len() as u32;
         for damage in damage {
             let Some((_, rect)) = Self::damage_rect(dst, *damage)? else {
                 continue;
             };
-            self.push_quad(rect, [[0.0; 2]; 4], color.components(), true)?;
+            self.push_quad(rect, [[0.0; 2]; 4], color, true)?;
         }
         let end = self.vertices.len() as u32;
         if start != end {
@@ -472,6 +556,7 @@ impl WgpuFrame<'_, '_> {
         self.vertices.clear();
         self.draws.clear();
         self.renderer.uniform_data.clear();
+        self.texture_uniform = None;
         result
     }
 
@@ -488,6 +573,14 @@ impl WgpuFrame<'_, '_> {
 impl Frame for WgpuFrame<'_, '_> {
     type Error = WgpuError;
     type TextureId = WgpuTexture;
+
+    fn color_transform(&self) -> Option<ColorTransform> {
+        self.color_transform
+    }
+
+    fn set_color_transform(&mut self, transform: Option<ColorTransform>) -> Option<ColorTransform> {
+        mem::replace(&mut self.color_transform, transform)
+    }
 
     fn context_id(&self) -> ContextId<WgpuTexture> {
         self.renderer.context_id.clone()
@@ -527,6 +620,7 @@ impl Frame for WgpuFrame<'_, '_> {
             None,
             &[],
             true,
+            None,
         )
     }
 

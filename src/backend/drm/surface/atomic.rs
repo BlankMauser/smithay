@@ -33,7 +33,7 @@ use crate::{
 
 use tracing::{debug, info, info_span, instrument, trace, warn};
 
-use super::color::{ColorProperties, ColorValues, ConnectorColor};
+use super::color::{ColorProperties, ColorValues, ConnectorColor, GammaLut};
 use super::{ConnectorColorCapabilities, ConnectorColorState, PlaneConfig, PlaneState, VrrSupport};
 
 #[derive(Debug, Clone)]
@@ -44,6 +44,7 @@ pub struct State {
     pub vrr: bool,
     pub connectors: HashSet<connector::Handle>,
     pub(super) colors: HashMap<connector::Handle, ConnectorColor>,
+    gamma: Option<GammaLut>,
 }
 
 impl PartialEq for State {
@@ -54,6 +55,7 @@ impl PartialEq for State {
             && self.vrr == other.vrr
             && self.connectors == other.connectors
             && self.colors == other.colors
+            && self.gamma == other.gamma
     }
 }
 
@@ -157,6 +159,7 @@ impl State {
             vrr: vrr.unwrap_or(false),
             connectors: current_connectors,
             colors,
+            gamma: None,
         })
     }
 
@@ -165,6 +168,7 @@ impl State {
         self.blob = property::Value::Unknown(0);
         self.connectors.clear();
         self.colors.clear();
+        self.gamma = None;
         self.active = false;
         self.vrr = false;
     }
@@ -225,6 +229,7 @@ impl AtomicDrmSurface {
             vrr: false,
             connectors: connectors.iter().copied().collect(),
             colors,
+            gamma: None,
         };
 
         drop(_guard);
@@ -307,6 +312,20 @@ impl AtomicDrmSurface {
 
     pub fn pending_mode(&self) -> Mode {
         self.pending.read().unwrap().mode
+    }
+
+    pub fn set_gamma_lut(&self, entries: Option<&[[u16; 3]]>) -> Result<(), Error> {
+        if !self.active.load(Ordering::SeqCst) {
+            return Err(Error::DeviceInactive);
+        }
+        let mut pending = self.pending.write().unwrap();
+        let gamma = GammaLut::prepare(self.device_fd(), self.crtc, entries)?;
+        pending.gamma = gamma;
+        Ok(())
+    }
+
+    pub fn clear_pending_gamma_lut(&self) {
+        self.pending.write().unwrap().gamma = None;
     }
 
     pub fn color_capabilities(&self, conn: connector::Handle) -> Result<ConnectorColorCapabilities, Error> {
@@ -432,6 +451,7 @@ impl AtomicDrmSurface {
                 self.crtc,
                 Some(pending.blob),
                 pending.vrr,
+                pending.gamma.as_ref(),
                 connectors.iter().map(|connector| {
                     (
                         connector,
@@ -501,6 +521,7 @@ impl AtomicDrmSurface {
             self.crtc,
             Some(pending.blob),
             pending.vrr,
+            pending.gamma.as_ref(),
             connectors.iter().map(|conn| (conn, pending.colors.get(conn))),
             [(&conn, pending.colors.get(&conn))],
             [&plane_state],
@@ -573,6 +594,7 @@ impl AtomicDrmSurface {
             self.crtc,
             Some(pending.blob),
             pending.vrr,
+            pending.gamma.as_ref(),
             conns.iter().map(|conn| (conn, colors.get(conn))),
             removed.map(|conn| (conn, current.colors.get(conn))),
             [&plane_state],
@@ -628,6 +650,7 @@ impl AtomicDrmSurface {
             self.crtc,
             Some(new_blob),
             pending.vrr,
+            pending.gamma.as_ref(),
             pending
                 .connectors
                 .iter()
@@ -754,6 +777,7 @@ impl AtomicDrmSurface {
             self.crtc,
             Some(pending.blob),
             value,
+            pending.gamma.as_ref(),
             pending
                 .connectors
                 .iter()
@@ -827,6 +851,7 @@ impl AtomicDrmSurface {
             self.crtc,
             Some(pending.blob),
             pending.vrr,
+            pending.gamma.as_ref(),
             pending_conns.iter().map(|conn| (conn, pending.colors.get(conn))),
             removed.map(|conn| (conn, current.colors.get(conn))),
             &*planes,
@@ -860,7 +885,7 @@ impl AtomicDrmSurface {
         let planes = planes.into_iter().collect::<Vec<_>>();
         let mut current = self.state.write().unwrap();
         let mut used_planes = self.used_planes.lock().unwrap();
-        let pending = self.pending.read().unwrap();
+        let mut pending = self.pending.write().unwrap();
 
         debug!(current = ?*current, pending = ?*pending, ?planes, "Preparing Commit",);
 
@@ -899,6 +924,7 @@ impl AtomicDrmSurface {
                 self.crtc,
                 Some(pending.blob),
                 pending.vrr,
+                pending.gamma.as_ref(),
                 pending_conns.iter().map(|conn| (conn, pending.colors.get(conn))),
                 removed.map(|conn| (conn, current.colors.get(conn))),
                 &*planes,
@@ -951,6 +977,9 @@ impl AtomicDrmSurface {
                     warn!("Failed to destroy old mode property blob: {}", err);
                 }
             }
+            // The kernel retains the committed blob; future frames must not
+            // overwrite later gamma-control changes with this transition.
+            pending.gamma = None;
             *current = pending.clone();
             for plane in planes.iter() {
                 if plane.config.is_some() {
@@ -985,6 +1014,7 @@ impl AtomicDrmSurface {
             self.crtc,
             None,
             self.state.read().unwrap().vrr,
+            None,
             [],
             [],
             &*planes,
@@ -1127,6 +1157,12 @@ impl AtomicDrmSurface {
                     .map(|color| (*conn, color))
             })
             .collect::<Result<_, Error>>()?;
+        let gamma = pending
+            .gamma
+            .as_ref()
+            .map(|gamma| GammaLut::prepare(self.device_fd(), self.crtc, gamma.entries.as_deref()))
+            .transpose()?
+            .flatten();
         // Re-initialize the mode blob which might got lost after suspend/resume
         let blob = self.fd.create_property_blob(&pending.mode).map_err(|source| {
             Error::Access(AccessError {
@@ -1138,6 +1174,7 @@ impl AtomicDrmSurface {
 
         let old_blob = std::mem::replace(&mut pending.blob, blob);
         pending.colors = colors;
+        pending.gamma = gamma;
         *current = restored;
         let _ = self.fd.destroy_property_blob(old_blob.into());
 
@@ -1726,6 +1763,22 @@ impl<'a> AtomicRequest<'a> {
 }
 
 impl<'a> AtomicRequest<'a> {
+    fn set_gamma_lut(&mut self, crtc: crtc::Handle, blob: u64) -> Result<(), Error> {
+        let handle = self.mapping.crtc_prop_handle(crtc, "GAMMA_LUT")?;
+        #[cfg(debug_assertions)]
+        {
+            let _ = handle;
+            self.crtc_props
+                .entry(crtc)
+                .or_default()
+                .insert("GAMMA_LUT", property::Value::Blob(blob));
+        }
+        #[cfg(not(debug_assertions))]
+        self.request
+            .add_property(crtc, handle, property::Value::Blob(blob));
+        Ok(())
+    }
+
     fn set_connector_color(&mut self, conn: connector::Handle, values: ColorValues) -> Result<(), Error> {
         for (name, value) in [
             ("HDR_OUTPUT_METADATA", values.hdr_metadata),
@@ -1751,11 +1804,13 @@ impl<'a> AtomicRequest<'a> {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_request(
         mapping: &'a PropMapping,
         crtc: crtc::Handle,
         blob: Option<property::Value<'static>>,
         vrr: bool,
+        gamma: Option<&GammaLut>,
         connectors: impl IntoIterator<Item = (&'a connector::Handle, Option<&'a ConnectorColor>)>,
         removed_connectors: impl IntoIterator<Item = (&'a connector::Handle, Option<&'a ConnectorColor>)>,
         planes: impl IntoIterator<Item = &'a PlaneState<'a>>,
@@ -1786,6 +1841,9 @@ impl<'a> AtomicRequest<'a> {
 
         // Set the crtc properties (active, mode_id, vrr_enabled).
         req.set_crtc(crtc, blob, vrr)?;
+        if let Some(gamma) = gamma {
+            req.set_gamma_lut(crtc, gamma.id())?;
+        }
 
         for plane_state in planes.into_iter() {
             req.set_plane(crtc, plane_state)?;
@@ -1853,7 +1911,7 @@ mod test {
                 conn,
                 props(&["CRTC_ID", "HDR_OUTPUT_METADATA", "Colorspace", "max bpc"]),
             )]),
-            crtcs: HashMap::from([(crtc, props(&["ACTIVE", "MODE_ID"]))]),
+            crtcs: HashMap::from([(crtc, props(&["ACTIVE", "MODE_ID", "GAMMA_LUT"]))]),
             planes: HashMap::from([(
                 plane,
                 props(&[
@@ -1894,11 +1952,13 @@ mod test {
                 },
             )
             .unwrap();
+        request.set_gamma_lut(crtc, 0).unwrap();
         let raw = |value: property::Value<'_>| u64::from(value);
         assert_eq!(raw(request.connector_props[&conn]["HDR_OUTPUT_METADATA"]), 201);
         assert_eq!(raw(request.connector_props[&conn]["Colorspace"]), 42);
         assert_eq!(raw(request.connector_props[&conn]["max bpc"]), 10);
         assert_eq!(raw(request.crtc_props[&crtc]["MODE_ID"]), 200);
+        assert_eq!(raw(request.crtc_props[&crtc]["GAMMA_LUT"]), 0);
         assert_eq!(raw(request.plane_props[&plane]["FB_ID"]), 4);
         assert!(request.build().is_ok());
     }

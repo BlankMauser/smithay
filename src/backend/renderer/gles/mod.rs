@@ -3,6 +3,7 @@
 // GL calls are all unsafe, so not very helpful in this module.
 #![allow(unsafe_op_in_unsafe_fn)]
 
+use crate::backend::renderer::ColorTransform;
 use core::slice;
 use glam::{Affine2, Mat3, Vec2};
 use std::{
@@ -387,6 +388,7 @@ pub struct GlesRenderer {
     min_filter: TextureFilter,
     max_filter: TextureFilter,
     debug_flags: DebugFlags,
+    color_transform: Option<ColorTransform>,
 
     // internals
     egl: EGLContext,
@@ -437,6 +439,7 @@ pub struct GlesFrame<'frame, 'buffer> {
     transform: Transform,
     size: Size<i32, Physical>,
     tex_program_override: Option<(GlesTexProgram, Vec<Uniform<'static>>)>,
+    color_transform: Option<ColorTransform>,
     finished: AtomicBool,
 
     span: EnteredSpan,
@@ -753,6 +756,7 @@ impl GlesRenderer {
             opaque_damage: Vec::with_capacity(16),
 
             debug_flags: DebugFlags::empty(),
+            color_transform: None,
             _not_send: PhantomData,
             span,
             gl_debug_span,
@@ -944,6 +948,7 @@ impl ImportMemWl for GlesRenderer {
                         // new texture, upload in full
                         upload_full = true;
                         let new = Arc::new(GlesTextureInternal {
+                            linear: AtomicBool::new(false),
                             texture: tex,
                             sync: RwLock::default(),
                             format: Some(internal_format),
@@ -1114,6 +1119,7 @@ impl ImportMem for GlesRenderer {
 
             // new texture, upload in full
             GlesTextureInternal {
+                linear: AtomicBool::new(false),
                 texture: tex,
                 sync,
                 format: Some(internal),
@@ -1255,6 +1261,7 @@ impl ImportEgl for GlesRenderer {
         let tex = self.import_egl_image(egl.image(0).unwrap(), egl.format == EGLFormat::External, None)?;
 
         let texture = GlesTexture(Arc::new(GlesTextureInternal {
+            linear: AtomicBool::new(false),
             texture: tex,
             sync: RwLock::default(),
             format: match egl.format {
@@ -1309,6 +1316,7 @@ impl ImportDma for GlesRenderer {
                 .unwrap_or(ffi::RGBA8);
             let has_alpha = has_alpha(buffer.format().code);
             let texture = GlesTexture(Arc::new(GlesTextureInternal {
+                linear: AtomicBool::new(false),
                 texture: tex,
                 sync: RwLock::default(),
                 format: Some(format),
@@ -1527,7 +1535,19 @@ impl ExportMem for GlesRenderer {
         }
 
         let size = texture_mapping.size();
-        let len = size.w * size.h * 4;
+        let bytes = gl_bpp(texture_mapping.format, texture_mapping.layout)
+            .ok_or(GlesError::UnsupportedPixelLayout)?
+            / 8;
+        let len = usize::try_from(size.w)
+            .ok()
+            .and_then(|width| {
+                usize::try_from(size.h)
+                    .ok()
+                    .and_then(|height| width.checked_mul(height))
+            })
+            .and_then(|pixels| pixels.checked_mul(bytes as usize))
+            .filter(|len| *len <= isize::MAX as usize)
+            .ok_or(GlesError::UnknownSize)?;
 
         let mapping_ptr = texture_mapping.mapping.load(Ordering::SeqCst);
         let ptr = if mapping_ptr.is_null() {
@@ -2012,6 +2032,16 @@ impl GlesRenderer {
         Ok(result)
     }
 
+    /// Input transform inherited by new frames, including damage-tracked offscreen passes.
+    pub fn set_color_transform(&mut self, transform: Option<ColorTransform>) -> Option<ColorTransform> {
+        std::mem::replace(&mut self.color_transform, transform)
+    }
+
+    /// Input transform inherited by new frames.
+    pub fn color_transform(&self) -> Option<ColorTransform> {
+        self.color_transform
+    }
+
     /// Compile a custom pixel shader for rendering with [`GlesFrame::render_pixel_shader_to`].
     ///
     /// Pixel shaders can be used for completely shader-driven drawing into a given region.
@@ -2058,6 +2088,9 @@ impl GlesRenderer {
         unsafe {
             Ok(GlesPixelProgram(Arc::new(GlesPixelProgramInner {
                 normal: GlesPixelProgramInternal {
+                    uniform_color_transform: self
+                        .gl
+                        .GetUniformLocation(program, c"smithay_color[0]".as_ptr()),
                     program,
                     uniform_matrix: self
                         .gl
@@ -2095,6 +2128,9 @@ impl GlesRenderer {
                         .collect(),
                 },
                 debug: GlesPixelProgramInternal {
+                    uniform_color_transform: self
+                        .gl
+                        .GetUniformLocation(debug_program, c"smithay_color[0]".as_ptr()),
                     program: debug_program,
                     uniform_matrix: self
                         .gl
@@ -2313,7 +2349,9 @@ impl Renderer for GlesRenderer {
         let current_projection = (flip180 * transform.matrix() * renderer).into();
         let span = span!(parent: &self.span, Level::DEBUG, "renderer_gles2_frame", current_projection = ?current_projection, size = ?output_size, transform = ?transform).entered();
 
+        let color_transform = self.color_transform;
         Ok(GlesFrame {
+            color_transform,
             renderer: self,
             target,
             // output transformation passed in by the user
@@ -2433,6 +2471,13 @@ static OUTPUT_VERTS: [ffi::types::GLfloat; 8] = [
 ];
 
 impl Frame for GlesFrame<'_, '_> {
+    fn color_transform(&self) -> Option<ColorTransform> {
+        self.color_transform
+    }
+    fn set_color_transform(&mut self, transform: Option<ColorTransform>) -> Option<ColorTransform> {
+        std::mem::replace(&mut self.color_transform, transform)
+    }
+
     type Error = GlesError;
     type TextureId = GlesTexture;
 
@@ -2632,6 +2677,10 @@ impl GlesFrame<'_, '_> {
             return Ok(());
         }
 
+        let color = self.color_transform.map_or(color, |transform| {
+            Color32F::from(transform.apply(color.components()))
+        });
+
         let mut mat = Mat3::IDENTITY;
         mat = self.current_projection * mat;
 
@@ -2753,6 +2802,59 @@ impl GlesFrame<'_, '_> {
         }
 
         Ok(())
+    }
+
+    /// Draw with an auxiliary 2D texture bound at texture unit one. The shader
+    /// declares its own sampler uniform; the caller assigns that uniform to one.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_texture_from_to_with_auxiliary(
+        &mut self,
+        texture: &GlesTexture,
+        src: Rectangle<f64, BufferCoord>,
+        dest: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        opaque_regions: &[Rectangle<i32, Physical>],
+        transform: Transform,
+        alpha: f32,
+        program: Option<&GlesTexProgram>,
+        additional_uniforms: &[Uniform<'_>],
+        auxiliary: Option<&GlesTexture>,
+    ) -> Result<(), GlesError> {
+        if let Some(auxiliary) = auxiliary {
+            let gl = &self.renderer.gl;
+            let sync = auxiliary.0.sync.read().unwrap();
+            unsafe {
+                sync.wait_for_upload(gl);
+                gl.ActiveTexture(ffi::TEXTURE1);
+                gl.BindTexture(ffi::TEXTURE_2D, auxiliary.tex_id());
+                gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::NEAREST as i32);
+                gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::NEAREST as i32);
+                gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_WRAP_S, ffi::CLAMP_TO_EDGE as i32);
+                gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_WRAP_T, ffi::CLAMP_TO_EDGE as i32);
+                gl.ActiveTexture(ffi::TEXTURE0);
+            }
+        }
+        let result = self.render_texture_from_to(
+            texture,
+            src,
+            dest,
+            damage,
+            opaque_regions,
+            transform,
+            alpha,
+            program,
+            additional_uniforms,
+        );
+        if let Some(auxiliary) = auxiliary {
+            let sync = auxiliary.0.sync.read().unwrap();
+            sync.update_read(&self.renderer.gl);
+            unsafe {
+                self.renderer.gl.ActiveTexture(ffi::TEXTURE1);
+                self.renderer.gl.BindTexture(ffi::TEXTURE_2D, 0);
+                self.renderer.gl.ActiveTexture(ffi::TEXTURE0);
+            }
+        }
+        result
     }
 
     /// Render part of a texture as given by src to the current target into the rectangle described by dst
@@ -3002,6 +3104,13 @@ impl GlesFrame<'_, '_> {
                 },
             );
             gl.UseProgram(program.program);
+            let transform = if tex.is_linear() {
+                None
+            } else {
+                self.color_transform
+            };
+            let color = transform.unwrap_or(ColorTransform::IDENTITY).to_uniforms();
+            gl.Uniform4fv(program.uniform_color_transform, 5, color.as_ptr().cast());
 
             gl.Uniform1i(program.uniform_tex, 0);
             gl.UniformMatrix3fv(program.uniform_matrix, 1, ffi::FALSE, matrix.as_ref().as_ptr());
@@ -3188,6 +3297,11 @@ impl GlesFrame<'_, '_> {
                 .profiler
                 .scope(gpu_span_location!("render_pixel_shader_to"), gl);
             gl.UseProgram(program.program);
+            let color = self
+                .color_transform
+                .unwrap_or(ColorTransform::IDENTITY)
+                .to_uniforms();
+            gl.Uniform4fv(program.uniform_color_transform, 5, color.as_ptr().cast());
 
             gl.UniformMatrix3fv(program.uniform_matrix, 1, ffi::FALSE, matrix.as_ref().as_ptr());
             gl.UniformMatrix3fv(
@@ -3672,3 +3786,6 @@ mod context_activation_tests {
         assert_eq!(unsafe { renderer.gl.IsTexture(texture_id) }, ffi::FALSE);
     }
 }
+
+#[cfg(test)]
+mod color_tests;

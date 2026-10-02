@@ -62,6 +62,7 @@
 //! }
 //! ```
 
+use crate::backend::renderer::ColorTransform;
 use std::fmt;
 
 use tracing::{instrument, warn};
@@ -226,6 +227,11 @@ pub enum WaylandSurfaceTexture<R: Renderer> {
     SolidColor(Color32F),
 }
 
+/// Committed compositor color metadata, owned by a wl_surface, never by its buffer.
+/// Update this only when the surface color state is committed.
+#[derive(Debug, Default)]
+pub struct SurfaceColorState(pub std::sync::Mutex<Option<ColorTransform>>);
+
 /// A single surface render element
 pub struct WaylandSurfaceRenderElement<R: Renderer> {
     id: Id,
@@ -241,6 +247,7 @@ pub struct WaylandSurfaceRenderElement<R: Renderer> {
     damage: DamageSnapshot<i32, BufferCoords>,
     opaque_regions: OpaqueRegions<i32, Logical>,
     texture: WaylandSurfaceTexture<R>,
+    color_transform: Option<ColorTransform>,
 }
 
 impl<R: Renderer> fmt::Debug for WaylandSurfaceRenderElement<R> {
@@ -275,14 +282,21 @@ impl<R: Renderer + ImportAll> WaylandSurfaceRenderElement<R> {
         let Some(data_ref) = states.data_map.get::<RendererSurfaceStateUserData>() else {
             return Ok(None);
         };
-        Ok(Self::from_state(
+        let mut element = Self::from_state(
             renderer,
             id,
             location,
             alpha * alpha_multiplier,
             kind,
             &data_ref.lock().unwrap(),
-        ))
+        );
+        if let Some(element) = element.as_mut() {
+            element.color_transform = states
+                .data_map
+                .get::<SurfaceColorState>()
+                .and_then(|state| *state.0.lock().unwrap());
+        }
+        Ok(element)
     }
 
     fn from_state(
@@ -320,6 +334,7 @@ impl<R: Renderer + ImportAll> WaylandSurfaceRenderElement<R> {
                 .map(OpaqueRegions::from_slice)
                 .unwrap_or_default(),
             texture,
+            color_transform: None,
         })
     }
 
@@ -327,6 +342,11 @@ impl<R: Renderer + ImportAll> WaylandSurfaceRenderElement<R> {
         ((self.view.dst.to_f64().to_physical(scale).to_point() + self.location).to_i32_round()
             - self.location.to_i32_round())
         .to_size()
+    }
+
+    /// The committed source transform copied at element construction.
+    pub fn color_transform(&self) -> Option<ColorTransform> {
+        self.color_transform
     }
 
     /// Get the buffer dimensions in logical coordinates
@@ -458,7 +478,11 @@ where
         opaque_regions: &[Rectangle<i32, Physical>],
         _cache: Option<&UserDataMap>,
     ) -> Result<(), R::Error> {
-        match self.texture {
+        let previous = frame.color_transform();
+        if let (Some(default), Some(source)) = (previous, self.color_transform) {
+            frame.set_color_transform(Some(default.for_source(source)));
+        }
+        let result = match self.texture {
             WaylandSurfaceTexture::Texture(ref texture) => frame.render_texture_from_to(
                 texture,
                 src,
@@ -469,6 +493,8 @@ where
                 self.alpha,
             ),
             WaylandSurfaceTexture::SolidColor(color) => frame.draw_solid(dst, damage, color * self.alpha),
-        }
+        };
+        frame.set_color_transform(previous);
+        result
     }
 }

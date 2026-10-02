@@ -362,7 +362,14 @@ impl VulkanInterop {
         let stat = rustix::fs::fstat(&fd).map_err(|err| VulkanError::InspectFd(err.into()))?;
         let identity = (stat.st_dev, stat.st_ino);
         let stride = dmabuf.strides().next().unwrap();
-        let minimum_stride = width.checked_mul(4).ok_or(VulkanError::InvalidStride)?;
+        let bytes_per_pixel = if wgpu_format == wgpu::TextureFormat::Rgba16Float {
+            8
+        } else {
+            4
+        };
+        let minimum_stride = width
+            .checked_mul(bytes_per_pixel)
+            .ok_or(VulkanError::InvalidStride)?;
         if stride < minimum_stride {
             return Err(VulkanError::InvalidStride);
         }
@@ -591,6 +598,10 @@ fn supported_formats() -> &'static [(DrmFourcc, wgpu::TextureFormat)] {
         (DrmFourcc::Xrgb8888, wgpu::TextureFormat::Bgra8Unorm),
         (DrmFourcc::Abgr8888, wgpu::TextureFormat::Rgba8Unorm),
         (DrmFourcc::Xbgr8888, wgpu::TextureFormat::Rgba8Unorm),
+        (DrmFourcc::Abgr2101010, wgpu::TextureFormat::Rgb10a2Unorm),
+        (DrmFourcc::Xbgr2101010, wgpu::TextureFormat::Rgb10a2Unorm),
+        (DrmFourcc::Abgr16161616f, wgpu::TextureFormat::Rgba16Float),
+        (DrmFourcc::Xbgr16161616f, wgpu::TextureFormat::Rgba16Float),
     ]
 }
 
@@ -598,6 +609,8 @@ fn texture_format_as_raw(format: wgpu::TextureFormat) -> vk::Format {
     match format {
         wgpu::TextureFormat::Bgra8Unorm => vk::Format::B8G8R8A8_UNORM,
         wgpu::TextureFormat::Rgba8Unorm => vk::Format::R8G8B8A8_UNORM,
+        wgpu::TextureFormat::Rgb10a2Unorm => vk::Format::A2B10G10R10_UNORM_PACK32,
+        wgpu::TextureFormat::Rgba16Float => vk::Format::R16G16B16A16_SFLOAT,
         _ => unreachable!("supported_formats only contains Vulkan formats handled here"),
     }
 }

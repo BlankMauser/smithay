@@ -1,8 +1,8 @@
 //! Connector color state applied with the surface's atomic modeset.
 
-use std::{ops::RangeInclusive, sync::Arc};
+use std::{ops::RangeInclusive, os::fd::AsFd, sync::Arc};
 
-use drm::control::{Device as ControlDevice, connector, property};
+use drm::control::{Device as ControlDevice, connector, crtc, property};
 
 use crate::{
     backend::drm::{
@@ -151,15 +151,107 @@ pub(super) struct ColorValues {
 }
 
 #[derive(Debug)]
-struct HdrBlob {
+struct PropertyBlob {
     device: DrmDeviceFd,
     id: u64,
 }
 
-impl Drop for HdrBlob {
+impl Drop for PropertyBlob {
     fn drop(&mut self) {
         let _ = self.device.destroy_property_blob(self.id);
     }
+}
+
+/// A one-shot CRTC gamma change, retained until its framebuffer commits.
+#[derive(Debug, Clone)]
+pub(super) struct GammaLut {
+    pub entries: Option<Arc<[[u16; 3]]>>,
+    blob: Option<Arc<PropertyBlob>>,
+}
+
+impl GammaLut {
+    pub fn id(&self) -> u64 {
+        self.blob.as_ref().map_or(0, |blob| blob.id)
+    }
+
+    pub fn prepare(
+        device: &DrmDeviceFd,
+        crtc: crtc::Handle,
+        entries: Option<&[[u16; 3]]>,
+    ) -> Result<Option<Self>, Error> {
+        let access = |source| {
+            Error::Access(AccessError {
+                errmsg: "Error preparing atomic gamma transition",
+                dev: device.dev_path(),
+                source,
+            })
+        };
+        let mut supported = false;
+        let mut size = 0;
+        for (handle, value) in device.get_properties(crtc).map_err(access)? {
+            let info = device.get_property(handle).map_err(access)?;
+            if info.name().to_bytes() == b"GAMMA_LUT"
+                && info.mutable()
+                && matches!(info.value_type(), property::ValueType::Blob)
+            {
+                supported = true;
+            } else if info.name().to_bytes() == b"GAMMA_LUT_SIZE" {
+                size = value;
+            }
+        }
+        if !supported {
+            return if entries.is_none() {
+                Ok(None)
+            } else {
+                Err(Error::InvalidGammaLut {
+                    crtc,
+                    reason: "CRTC has no atomic gamma LUT",
+                })
+            };
+        }
+        let blob = if let Some(entries) = entries {
+            if !valid_gamma_size(entries.len(), size) {
+                return Err(Error::InvalidGammaLut {
+                    crtc,
+                    reason: "gamma table must match bounded GAMMA_LUT_SIZE",
+                });
+            }
+            let mut bytes = encode_gamma(entries);
+            let id = drm_ffi::mode::create_property_blob(device.as_fd(), &mut bytes)
+                .map_err(access)?
+                .blob_id;
+            Some(Arc::new(PropertyBlob {
+                device: device.clone(),
+                id: u64::from(id),
+            }))
+        } else {
+            None
+        };
+        Ok(Some(Self {
+            entries: entries.map(Arc::from),
+            blob,
+        }))
+    }
+}
+
+impl PartialEq for GammaLut {
+    fn eq(&self, other: &Self) -> bool {
+        self.id() == other.id()
+    }
+}
+
+fn valid_gamma_size(length: usize, size: u64) -> bool {
+    length > 0 && length <= 1 << 20 && length as u64 == size
+}
+
+fn encode_gamma(entries: &[[u16; 3]]) -> Vec<u8> {
+    let mut bytes = vec![0; entries.len() * 8];
+    for (entry, encoded) in entries.iter().zip(bytes.chunks_exact_mut(8)) {
+        for (component, output) in entry.iter().zip(encoded.chunks_exact_mut(2)) {
+            output.copy_from_slice(&component.to_ne_bytes());
+        }
+    }
+    bytes
 }
 
 /// Owned blobs are shared by pending and committed state until both release them.
@@ -168,7 +260,7 @@ pub(super) struct ConnectorColor {
     pub state: Option<ConnectorColorState>,
     pub values: ColorValues,
     pub default_colorspace: Option<u64>,
-    _blob: Option<Arc<HdrBlob>>,
+    _blob: Option<Arc<PropertyBlob>>,
 }
 
 impl PartialEq for ConnectorColor {
@@ -314,7 +406,7 @@ impl ColorProperties {
                         source,
                     })
                 })?;
-                Ok::<_, Error>(Arc::new(HdrBlob {
+                Ok::<_, Error>(Arc::new(PropertyBlob {
                     device: device.clone(),
                     id: id.into(),
                 }))
@@ -565,5 +657,18 @@ mod tests {
             props.capabilities().colorspaces,
             [ColorSpace::Default, ColorSpace::Bt2020Rgb]
         );
+    }
+    #[test]
+    fn gamma_blob_preserves_u16_channels_and_zero_padding() {
+        let encoded = encode_gamma(&[[1, 2, 3], [65535, 32768, 0]]);
+        let entries: Vec<u16> = encoded
+            .chunks_exact(2)
+            .map(|bytes| u16::from_ne_bytes(bytes.try_into().unwrap()))
+            .collect();
+        assert_eq!(entries, [1, 2, 3, 0, 65535, 32768, 0, 0]);
+        assert!(valid_gamma_size(262145, 262145));
+        assert!(!valid_gamma_size(0, 0));
+        assert!(!valid_gamma_size(1024, 4096));
+        assert!(!valid_gamma_size((1 << 20) + 1, (1 << 20) + 1));
     }
 }

@@ -91,6 +91,14 @@ pub enum Error {
         /// Reason the state could not be staged.
         reason: &'static str,
     },
+    /// A staged gamma table cannot be represented by this CRTC.
+    #[error("Invalid gamma LUT on crtc ({crtc:?}): {reason}")]
+    InvalidGammaLut {
+        /// Target CRTC.
+        crtc: crtc::Handle,
+        /// Validation failure.
+        reason: &'static str,
+    },
     /// Atomic Test failed for new properties
     #[error("Atomic Test failed for new properties on crtc ({0:?})")]
     TestFailed(crtc::Handle),

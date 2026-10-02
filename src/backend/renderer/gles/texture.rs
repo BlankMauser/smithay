@@ -28,6 +28,7 @@ impl GlesTexture {
         size: Size<i32, BufferCoord>,
     ) -> GlesTexture {
         GlesTexture(Arc::new(GlesTextureInternal {
+            linear: AtomicBool::new(false),
             texture: tex,
             sync: RwLock::default(),
             format: internal_format,
@@ -38,6 +39,15 @@ impl GlesTexture {
             egl_images: None,
             destruction_callback_sender: renderer.gles_cleanup().sender.clone(),
         }))
+    }
+
+    /// Mark a compositor-owned texture as already in the linear working space.
+    pub fn set_linear(&self, linear: bool) {
+        self.0.linear.store(linear, std::sync::atomic::Ordering::Relaxed);
+    }
+    /// Whether input transfer decoding should be skipped for this retained texture.
+    pub fn is_linear(&self) -> bool {
+        self.0.linear.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// OpenGL texture id of this texture
@@ -122,6 +132,7 @@ impl TextureSync {
 
 #[derive(Debug)]
 pub(super) struct GlesTextureInternal {
+    pub(super) linear: AtomicBool,
     pub(super) texture: ffi::types::GLuint,
     pub(super) sync: RwLock<TextureSync>,
     pub(super) format: Option<ffi::types::GLenum>,

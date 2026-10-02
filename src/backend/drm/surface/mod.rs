@@ -191,6 +191,29 @@ impl BasicDevice for DrmSurface {}
 impl ControlDevice for DrmSurface {}
 
 impl DrmSurface {
+    /// Stage a one-shot gamma change with the next atomic framebuffer/color commit.
+    /// `None` selects identity; a table contains exactly GAMMA_LUT_SIZE RGB entries.
+    /// Failed tests/commits retain this request; a successful commit consumes it so
+    /// subsequent gamma-control changes are not overwritten. Legacy accepts only
+    /// an identity request; its ordinary gamma ioctl remains separate.
+    pub fn set_gamma_lut(&self, lut: Option<&[[u16; 3]]>) -> Result<(), Error> {
+        match &*self.internal {
+            DrmSurfaceInternal::Atomic(surface) => surface.set_gamma_lut(lut),
+            DrmSurfaceInternal::Legacy(_) if lut.is_none() => Ok(()),
+            DrmSurfaceInternal::Legacy(_) => Err(Error::InvalidGammaLut {
+                crtc: self.crtc(),
+                reason: "atomic gamma transition requires atomic DRM",
+            }),
+        }
+    }
+
+    /// Cancel a staged gamma transition without changing the working hardware LUT.
+    pub fn clear_pending_gamma_lut(&self) {
+        if let DrmSurfaceInternal::Atomic(surface) = &*self.internal {
+            surface.clear_pending_gamma_lut();
+        }
+    }
+
     /// Returns driver color-property support for a connector attached to this surface.
     ///
     /// EDID support and the framebuffer's pixel encoding must be checked separately.

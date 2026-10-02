@@ -1,6 +1,9 @@
 use std::{
     fmt,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use drm_fourcc::DrmFourcc;
@@ -16,6 +19,7 @@ pub(super) fn format_to_wgpu(format: DrmFourcc) -> Result<::wgpu::TextureFormat,
         DrmFourcc::Argb8888 | DrmFourcc::Xrgb8888 => Ok(::wgpu::TextureFormat::Bgra8Unorm),
         DrmFourcc::Abgr8888 | DrmFourcc::Xbgr8888 => Ok(::wgpu::TextureFormat::Rgba8Unorm),
         DrmFourcc::Abgr2101010 | DrmFourcc::Xbgr2101010 => Ok(::wgpu::TextureFormat::Rgb10a2Unorm),
+        DrmFourcc::Abgr16161616f | DrmFourcc::Xbgr16161616f => Ok(::wgpu::TextureFormat::Rgba16Float),
         _ => Err(WgpuError::UnsupportedPixelFormat(format)),
     }
 }
@@ -25,18 +29,25 @@ pub(super) fn wgpu_to_format(format: ::wgpu::TextureFormat) -> Result<DrmFourcc,
         ::wgpu::TextureFormat::Bgra8Unorm => Ok(DrmFourcc::Argb8888),
         ::wgpu::TextureFormat::Rgba8Unorm => Ok(DrmFourcc::Abgr8888),
         ::wgpu::TextureFormat::Rgb10a2Unorm => Ok(DrmFourcc::Abgr2101010),
+        ::wgpu::TextureFormat::Rgba16Float => Ok(DrmFourcc::Abgr16161616f),
         _ => Err(WgpuError::UnsupportedWgpuFormat(format)),
     }
 }
 
 pub(super) fn bytes_per_pixel(format: DrmFourcc) -> Result<usize, WgpuError> {
-    format_to_wgpu(format).map(|_| 4)
+    format_to_wgpu(format).map(|format| {
+        if format == ::wgpu::TextureFormat::Rgba16Float {
+            8
+        } else {
+            4
+        }
+    })
 }
 
 pub(super) fn has_alpha(format: DrmFourcc) -> bool {
     matches!(
         format,
-        DrmFourcc::Argb8888 | DrmFourcc::Abgr8888 | DrmFourcc::Abgr2101010
+        DrmFourcc::Argb8888 | DrmFourcc::Abgr8888 | DrmFourcc::Abgr2101010 | DrmFourcc::Abgr16161616f
     )
 }
 
@@ -49,6 +60,7 @@ pub(crate) struct WgpuTextureInner {
     pub(crate) flipped: bool,
     pub(crate) context: ContextId<WgpuTexture>,
     pub(crate) sync: Option<Arc<dyn WgpuTextureSync>>,
+    linear: AtomicBool,
     bind_groups: Mutex<[Option<::wgpu::BindGroup>; 4]>,
 }
 
@@ -137,6 +149,7 @@ impl WgpuTexture {
             flipped,
             context,
             sync,
+            linear: AtomicBool::new(false),
             bind_groups: Mutex::new(std::array::from_fn(|_| None)),
         }))
     }
@@ -155,6 +168,16 @@ impl WgpuTexture {
 
     pub(crate) fn wgpu_format(&self) -> ::wgpu::TextureFormat {
         self.0.wgpu_format
+    }
+
+    /// Mark retained contents as already converted to the linear working space.
+    pub fn set_linear(&self, linear: bool) {
+        self.0.linear.store(linear, Ordering::Relaxed);
+    }
+
+    /// Whether input color conversion should be bypassed when sampling this texture.
+    pub fn is_linear(&self) -> bool {
+        self.0.linear.load(Ordering::Relaxed)
     }
 
     /// Returns whether the texture contents have an inverted y-axis.

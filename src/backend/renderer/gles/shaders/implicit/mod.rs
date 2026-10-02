@@ -9,6 +9,7 @@ pub(in super::super) const FRAGMENT_SHADER_SOLID: &str = include_str!("./solid.f
 
 #[derive(Debug)]
 pub(in super::super) struct GlesTexProgramInternal {
+    pub(in super::super) uniform_color_transform: ffi::types::GLint,
     pub(in super::super) program: ffi::types::GLuint,
     pub(in super::super) uniform_tex: ffi::types::GLint,
     pub(in super::super) uniform_tex_matrix: ffi::types::GLint,
@@ -103,6 +104,7 @@ pub(in super::super) struct GlesPixelProgramInner {
 
 #[derive(Debug)]
 pub(in super::super) struct GlesPixelProgramInternal {
+    pub(in super::super) uniform_color_transform: ffi::types::GLint,
     pub(in super::super) program: ffi::types::GLuint,
     pub(in super::super) uniform_matrix: ffi::types::GLint,
     pub(in super::super) uniform_tex_matrix: ffi::types::GLint,

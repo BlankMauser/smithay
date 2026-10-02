@@ -281,6 +281,14 @@ impl RendererSurfaceState {
         })
     }
 
+    /// Invalidate the whole surface after compositor-owned metadata changes.
+    /// Buffer contents remain attached; existing damage-tracked caches repaint.
+    pub fn damage_all(&mut self) {
+        if let Some(size) = self.buffer_dimensions {
+            self.damage.add([Rectangle::from_size(size)]);
+        }
+    }
+
     /// Gets the current damage of this surface
     pub fn damage(&self) -> DamageSnapshot<i32, BufferCoord> {
         self.damage.snapshot()

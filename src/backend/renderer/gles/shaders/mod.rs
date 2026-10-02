@@ -76,7 +76,9 @@ pub unsafe fn link_program(
     frag_src: &str,
 ) -> Result<ffi::types::GLuint, GlesError> {
     let vert = compile_shader(gl, ffi::VERTEX_SHADER, vert_src)?;
-    let frag = compile_shader(gl, ffi::FRAGMENT_SHADER, frag_src)?;
+    let mut managed_source = frag_src.replace("void main(", "void smithay_original_main(");
+    managed_source.push_str(include_str!("color.frag"));
+    let frag = compile_shader(gl, ffi::FRAGMENT_SHADER, &managed_source)?;
     let program = gl.CreateProgram();
     gl.AttachShader(program, vert);
     gl.AttachShader(program, frag);
@@ -153,6 +155,7 @@ pub(super) unsafe fn texture_program(
         Ok(GlesTexProgramVariant {
             normal: GlesTexProgramInternal {
                 program,
+                uniform_color_transform: gl.GetUniformLocation(program, c"smithay_color[0]".as_ptr()),
                 uniform_tex: gl.GetUniformLocation(program, tex.as_ptr() as *const ffi::types::GLchar),
                 uniform_matrix: gl.GetUniformLocation(program, matrix.as_ptr() as *const ffi::types::GLchar),
                 uniform_tex_matrix: gl
@@ -179,6 +182,7 @@ pub(super) unsafe fn texture_program(
             },
             debug: GlesTexProgramInternal {
                 program: debug_program,
+                uniform_color_transform: gl.GetUniformLocation(debug_program, c"smithay_color[0]".as_ptr()),
                 uniform_tex: gl.GetUniformLocation(debug_program, tex.as_ptr() as *const ffi::types::GLchar),
                 uniform_matrix: gl
                     .GetUniformLocation(debug_program, matrix.as_ptr() as *const ffi::types::GLchar),

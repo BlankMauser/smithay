@@ -16,8 +16,8 @@ use crate::{
     backend::{
         allocator::{dmabuf::Dmabuf, format::FormatSet},
         renderer::{
-            Bind, Blit, ContextId, DebugFlags, ExportMem, Frame, ImportDma, ImportMem, Offscreen, Renderer,
-            RendererSuper, Texture, TextureFilter, sync::SyncPoint,
+            Bind, Blit, ColorTransform, ContextId, DebugFlags, ExportMem, Frame, ImportDma, ImportMem,
+            Offscreen, Renderer, RendererSuper, Texture, TextureFilter, sync::SyncPoint,
         },
     },
     utils::{Buffer, Physical, Rectangle, Size, Transform},
@@ -48,6 +48,8 @@ mod custom;
 mod error;
 mod frame;
 mod sync;
+#[cfg(test)]
+mod tests;
 mod texture;
 mod uniform;
 #[cfg(unix)]
@@ -67,6 +69,8 @@ const MEM_FORMATS: &[DrmFourcc] = &[
     DrmFourcc::Xbgr8888,
     DrmFourcc::Abgr2101010,
     DrmFourcc::Xbgr2101010,
+    DrmFourcc::Abgr16161616f,
+    DrmFourcc::Xbgr16161616f,
 ];
 
 #[repr(C)]
@@ -124,14 +128,24 @@ fn create_uniform_bind_group(
     device.create_bind_group(&::wgpu::BindGroupDescriptor {
         label: Some("Smithay WGPU custom uniform bind group"),
         layout,
-        entries: &[::wgpu::BindGroupEntry {
-            binding: 0,
-            resource: ::wgpu::BindingResource::Buffer(::wgpu::BufferBinding {
-                buffer,
-                offset: 0,
-                size: std::num::NonZeroU64::new(custom::UNIFORM_SIZE),
-            }),
-        }],
+        entries: &[
+            ::wgpu::BindGroupEntry {
+                binding: 0,
+                resource: ::wgpu::BindingResource::Buffer(::wgpu::BufferBinding {
+                    buffer,
+                    offset: 0,
+                    size: std::num::NonZeroU64::new(custom::CUSTOM_UNIFORM_SIZE),
+                }),
+            },
+            ::wgpu::BindGroupEntry {
+                binding: 1,
+                resource: ::wgpu::BindingResource::Buffer(::wgpu::BufferBinding {
+                    buffer,
+                    offset: 0,
+                    size: std::num::NonZeroU64::new(custom::UNIFORM_SIZE),
+                }),
+            },
+        ],
     })
 }
 
@@ -143,10 +157,12 @@ enum DrawKind {
     Texture {
         texture: WgpuTexture,
         opaque: bool,
+        uniform_offset: u32,
     },
     CustomTexture {
         texture: WgpuTexture,
         program: WgpuTexProgram,
+        auxiliary: Option<WgpuTexture>,
         blend: bool,
         uniform_offset: u32,
     },
@@ -210,6 +226,7 @@ pub struct WgpuRenderer {
     queue: ::wgpu::Queue,
     context_id: ContextId<WgpuTexture>,
     debug_flags: DebugFlags,
+    color_transform: Option<ColorTransform>,
     min_filter: TextureFilter,
     mag_filter: TextureFilter,
     texture_layout: ::wgpu::BindGroupLayout,
@@ -222,7 +239,7 @@ pub struct WgpuRenderer {
     uniform_capacity: usize,
     uniform_data: Vec<u8>,
     prepared_pipelines: Vec<Option<::wgpu::RenderPipeline>>,
-    prepared_bind_groups: Vec<Option<::wgpu::BindGroup>>,
+    prepared_bind_groups: Vec<(Option<::wgpu::BindGroup>, Option<::wgpu::BindGroup>)>,
     samplers: [[::wgpu::Sampler; 2]; 2],
     shader: ::wgpu::ShaderModule,
     pipelines: HashMap<::wgpu::TextureFormat, Pipelines>,
@@ -273,16 +290,28 @@ impl WgpuRenderer {
         });
         let uniform_layout = device.create_bind_group_layout(&::wgpu::BindGroupLayoutDescriptor {
             label: Some("Smithay WGPU custom uniform layout"),
-            entries: &[::wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: ::wgpu::ShaderStages::FRAGMENT,
-                ty: ::wgpu::BindingType::Buffer {
-                    ty: ::wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: true,
-                    min_binding_size: std::num::NonZeroU64::new(custom::UNIFORM_SIZE),
+            entries: &[
+                ::wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: ::wgpu::ShaderStages::FRAGMENT,
+                    ty: ::wgpu::BindingType::Buffer {
+                        ty: ::wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: true,
+                        min_binding_size: std::num::NonZeroU64::new(custom::CUSTOM_UNIFORM_SIZE),
+                    },
+                    count: None,
                 },
-                count: None,
-            }],
+                ::wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: ::wgpu::ShaderStages::FRAGMENT,
+                    ty: ::wgpu::BindingType::Buffer {
+                        ty: ::wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: true,
+                        min_binding_size: std::num::NonZeroU64::new(custom::UNIFORM_SIZE),
+                    },
+                    count: None,
+                },
+            ],
         });
         let uniform_alignment = device.limits().min_uniform_buffer_offset_alignment as usize;
         let uniform_stride =
@@ -365,7 +394,9 @@ impl WgpuRenderer {
         });
         let shader = device.create_shader_module(::wgpu::ShaderModuleDescriptor {
             label: Some("Smithay WGPU renderer shader"),
-            source: ::wgpu::ShaderSource::Wgsl(include_str!("shaders.wgsl").into()),
+            source: ::wgpu::ShaderSource::Wgsl(
+                format!("{}\n{}", include_str!("color.wgsl"), include_str!("shaders.wgsl")).into(),
+            ),
         });
         let vertex_capacity = 6 * 64;
         let vertex_buffer_size = vertex_capacity * mem::size_of::<Vertex>();
@@ -389,6 +420,7 @@ impl WgpuRenderer {
             queue,
             context_id: ContextId::new(),
             debug_flags: DebugFlags::empty(),
+            color_transform: None,
             min_filter: TextureFilter::Linear,
             mag_filter: TextureFilter::Linear,
             texture_layout,
@@ -414,6 +446,16 @@ impl WgpuRenderer {
             #[cfg(unix)]
             vulkan,
         })
+    }
+
+    /// Input transform copied into newly created frames.
+    pub fn color_transform(&self) -> Option<ColorTransform> {
+        self.color_transform
+    }
+
+    /// Set the input transform for newly created frames, returning the previous value.
+    pub fn set_color_transform(&mut self, transform: Option<ColorTransform>) -> Option<ColorTransform> {
+        mem::replace(&mut self.color_transform, transform)
     }
 
     /// Returns the WGPU device used by this renderer.
@@ -493,7 +535,7 @@ impl WgpuRenderer {
         })
     }
 
-    fn push_uniform_data(&mut self, data: &[f32; custom::UNIFORM_SLOTS * 4]) -> Result<u32, WgpuError> {
+    fn push_uniform_data(&mut self, data: &[f32; custom::TOTAL_UNIFORM_SLOTS * 4]) -> Result<u32, WgpuError> {
         let offset = self.uniform_data.len();
         if offset > u32::MAX as usize {
             return Err(WgpuError::Unsupported);
@@ -539,7 +581,7 @@ impl WgpuRenderer {
         blend: Option<::wgpu::BlendState>,
         texture_layout: bool,
     ) -> ::wgpu::RenderPipeline {
-        let texture_layouts = [Some(&self.texture_layout)];
+        let texture_layouts = [Some(&self.texture_layout), Some(&self.uniform_layout)];
         let layout = self
             .device
             .create_pipeline_layout(&::wgpu::PipelineLayoutDescriptor {
@@ -641,6 +683,14 @@ impl WgpuRenderer {
                 used.push(texture);
             }
         }
+        for auxiliary in draws.iter().filter_map(|draw| match &draw.kind {
+            DrawKind::CustomTexture { auxiliary, .. } => auxiliary.as_ref(),
+            _ => None,
+        }) {
+            if !used.iter().any(|used| std::ptr::eq(used.raw(), auxiliary.raw())) {
+                used.push(auxiliary);
+            }
+        }
         if !vertices.is_empty() {
             self.ensure_vertex_capacity(vertices.len())?;
             // Vertex is repr(C) and contains only contiguous f32 fields, with no padding.
@@ -689,10 +739,19 @@ impl WgpuRenderer {
         let mut bind_groups = mem::take(&mut self.prepared_bind_groups);
         bind_groups.clear();
         bind_groups.extend(draws.iter().map(|draw| match &draw.kind {
-            DrawKind::Texture { texture, .. } | DrawKind::CustomTexture { texture, .. } => {
-                Some(texture.bind_group(sampler_index, &self.device, &self.texture_layout, sampler))
-            }
-            _ => None,
+            DrawKind::Texture { texture, .. } => (
+                Some(texture.bind_group(sampler_index, &self.device, &self.texture_layout, sampler)),
+                None,
+            ),
+            DrawKind::CustomTexture {
+                texture, auxiliary, ..
+            } => (
+                Some(texture.bind_group(sampler_index, &self.device, &self.texture_layout, sampler)),
+                auxiliary.as_ref().map(|texture| {
+                    texture.bind_group(sampler_index, &self.device, &self.texture_layout, sampler)
+                }),
+            ),
+            _ => (None, None),
         }));
         {
             let mut pass = encoder.begin_render_pass(&::wgpu::RenderPassDescriptor {
@@ -714,33 +773,47 @@ impl WgpuRenderer {
             pass.set_viewport(0.0, 0.0, viewport.w as f32, viewport.h as f32, 0.0, 1.0);
             pass.set_scissor_rect(0, 0, viewport.w as u32, viewport.h as u32);
             pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-            for ((draw, bind_group), custom_pipeline) in draws.iter().zip(&bind_groups).zip(&custom_pipelines)
+            for ((draw, (bind_group, auxiliary)), custom_pipeline) in
+                draws.iter().zip(&bind_groups).zip(&custom_pipelines)
             {
                 match &draw.kind {
                     DrawKind::Replace => pass.set_pipeline(&pipelines.replace),
                     DrawKind::Solid => pass.set_pipeline(&pipelines.solid),
                     DrawKind::SolidMultiply => pass.set_pipeline(&pipelines.solid_multiply),
-                    DrawKind::Texture { opaque, .. } => {
+                    DrawKind::Texture {
+                        opaque,
+                        uniform_offset,
+                        ..
+                    } => {
                         pass.set_pipeline(if *opaque {
                             &pipelines.texture_opaque
                         } else {
                             &pipelines.texture
                         });
                         pass.set_bind_group(0, bind_group.as_ref().unwrap(), &[]);
+                        pass.set_bind_group(1, &self.uniform_bind_group, &[*uniform_offset, *uniform_offset]);
                         pass.draw(draw.vertices.clone(), 0..1);
                         continue;
                     }
                     DrawKind::CustomTexture { uniform_offset, .. } => {
                         pass.set_pipeline(custom_pipeline.as_ref().unwrap());
+                        pass.set_bind_group(
+                            2,
+                            auxiliary
+                                .as_ref()
+                                .unwrap_or(&self.dummy_bind_groups[sampler_index]),
+                            &[],
+                        );
                         pass.set_bind_group(0, bind_group.as_ref().unwrap(), &[]);
-                        pass.set_bind_group(1, &self.uniform_bind_group, &[*uniform_offset]);
+                        pass.set_bind_group(1, &self.uniform_bind_group, &[*uniform_offset, *uniform_offset]);
                         pass.draw(draw.vertices.clone(), 0..1);
                         continue;
                     }
                     DrawKind::CustomPixel { uniform_offset, .. } => {
                         pass.set_pipeline(custom_pipeline.as_ref().unwrap());
+                        pass.set_bind_group(2, &self.dummy_bind_groups[sampler_index], &[]);
                         pass.set_bind_group(0, &self.dummy_bind_groups[sampler_index], &[]);
-                        pass.set_bind_group(1, &self.uniform_bind_group, &[*uniform_offset]);
+                        pass.set_bind_group(1, &self.uniform_bind_group, &[*uniform_offset, *uniform_offset]);
                         pass.draw(draw.vertices.clone(), 0..1);
                         continue;
                     }
@@ -985,6 +1058,8 @@ pub struct WgpuFrame<'frame, 'buffer> {
     target: &'frame mut WgpuTarget<'buffer>,
     output_size: Size<i32, Physical>,
     transform: Transform,
+    color_transform: Option<ColorTransform>,
+    texture_uniform: Option<(Option<ColorTransform>, u32)>,
     vertices: Vec<Vertex>,
     draws: Vec<Draw>,
 }
@@ -1036,6 +1111,8 @@ impl Renderer for WgpuRenderer {
             target: framebuffer,
             output_size,
             transform: dst_transform,
+            color_transform: self.color_transform,
+            texture_uniform: None,
             vertices: mem::take(&mut self.vertices),
             draws: mem::take(&mut self.draws),
             renderer: self,
@@ -1429,6 +1506,7 @@ impl Blit for WgpuRenderer {
                 None,
                 &[],
                 false,
+                None,
             )?;
             frame.finish()
         })();

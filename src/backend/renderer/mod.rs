@@ -36,8 +36,8 @@ pub mod pixman;
 #[cfg(feature = "renderer_wgpu")]
 pub mod wgpu;
 
-mod color;
-pub use color::Color32F;
+pub mod color;
+pub use color::{Color32F, ColorTransform};
 
 use crate::backend::allocator::{Format, Fourcc, dmabuf::Dmabuf};
 #[cfg(all(
@@ -278,6 +278,16 @@ pub trait Frame {
 
     /// Returns the [`ContextId`] of the associated renderer.
     fn context_id(&self) -> ContextId<Self::TextureId>;
+
+    /// Current input color transform; `None` retains unmanaged rendering.
+    fn color_transform(&self) -> Option<ColorTransform> {
+        None
+    }
+
+    /// Replace the input transform and return its previous value.
+    fn set_color_transform(&mut self, _transform: Option<ColorTransform>) -> Option<ColorTransform> {
+        None
+    }
 
     /// Clear the complete current target with a single given color.
     ///
