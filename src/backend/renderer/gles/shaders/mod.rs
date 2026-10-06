@@ -65,6 +65,26 @@ pub unsafe fn compile_shader(
     Ok(shader)
 }
 
+/// The name of the color output a GLSL ES 3.00 fragment shader declares
+/// (`out vec4 name;`, with or without a layout qualifier), or `None` for a
+/// shader that writes `gl_FragColor`.
+fn fragment_output(frag_src: &str) -> Option<&str> {
+    if !frag_src.trim_start().starts_with("#version 300 es") {
+        return None;
+    }
+    frag_src.lines().find_map(|line| {
+        let line = line.split("//").next()?.trim();
+        let line = match line.strip_prefix("layout") {
+            Some(rest) => rest.split_once(')')?.1.trim_start(),
+            None => line,
+        };
+        let declaration = line.strip_prefix("out")?.strip_suffix(';')?;
+        let mut tokens = declaration.split_whitespace();
+        let name = tokens.next_back()?;
+        tokens.any(|token| token == "vec4").then_some(name)
+    })
+}
+
 /// Compiles and links a shader program.
 ///
 /// # Safety
@@ -77,7 +97,11 @@ pub unsafe fn link_program(
 ) -> Result<ffi::types::GLuint, GlesError> {
     let vert = compile_shader(gl, ffi::VERTEX_SHADER, vert_src)?;
     let mut managed_source = frag_src.replace("void main(", "void smithay_original_main(");
-    managed_source.push_str(include_str!("color.frag"));
+    match fragment_output(frag_src) {
+        // GLSL ES 3.00 has no gl_FragColor: convert the shader's own output.
+        Some(output) => managed_source.push_str(&include_str!("color.frag").replace("gl_FragColor", output)),
+        None => managed_source.push_str(include_str!("color.frag")),
+    }
     let frag = compile_shader(gl, ffi::FRAGMENT_SHADER, &managed_source)?;
     let program = gl.CreateProgram();
     gl.AttachShader(program, vert);
@@ -239,4 +263,24 @@ pub(super) unsafe fn solid_program(gl: &ffi::Gles2) -> Result<GlesSolidProgram, 
         attrib_vert: gl.GetAttribLocation(program, vert.as_ptr() as *const ffi::types::GLchar),
         attrib_position: gl.GetAttribLocation(program, position.as_ptr() as *const ffi::types::GLchar),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fragment_output;
+
+    #[test]
+    fn fragment_output_names_the_es3_color_output() {
+        assert_eq!(fragment_output("precision mediump float;\nvoid main() {}"), None);
+        assert_eq!(fragment_output("#version 100\nvoid main() {}"), None);
+        assert_eq!(
+            fragment_output("#version 300 es\nin vec2 uv;\nout vec4 fragColor;\nvoid main() {}"),
+            Some("fragColor")
+        );
+        assert_eq!(
+            fragment_output("#version 300 es\nlayout(location = 0) out highp vec4 color; // target\n"),
+            Some("color")
+        );
+        assert_eq!(fragment_output("#version 300 es\nout float depth;\n"), None);
+    }
 }
