@@ -1,0 +1,19 @@
+src/backend/renderer/gles/shaders/mod.rs
+  s_341d7577eb6f3d::t_76e7a5210f7630 68-87,100-104,267-286
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "370b22b0c8e54c6d6581009165e55a6c2a3fab70",
+  "prompts": {},
+  "sessions": {
+    "s_341d7577eb6f3d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f5bee3ee-6504-451d-a8b6-eb7a99ea09da",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "BlankMauser <thomasluvan@gmail.com>"
+    }
+  }
+}
