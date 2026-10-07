@@ -67,6 +67,7 @@ fn gl_generate() {
                 "GL_EXT_unpack_subimage",
                 "GL_OES_EGL_sync",
                 "GL_EXT_disjoint_timer_query",
+                "GL_KHR_parallel_shader_compile",
             ],
         )
         .write_bindings(gl_generator::StructGenerator, &mut file)
