@@ -123,6 +123,8 @@ with the correct lock instance.
 `backend::input` and `input` now use `backend::input::InputTime` for timestamps instead of `u32` or `u64`. `InputTime::now()`
 is used for timestamps for synthesized events.
 
+`TextInputActivation` must be implemented. It allows for hooks to be run when a text input is `activated` and `deactivated`.
+
 ### Additions
 
 - Add `WmWindowProperty::Other` to forward unrecognized X11 property changes to the compositor.
@@ -236,6 +238,11 @@ additionally drops the buffers cached for copying between a render and a target 
 `Renderer` owns.
 
 ### Bugfixes
+
+`input_method_v2`: a second input method binding a seat that already has one is now the object told
+it is `unavailable`, per the protocol, leaving the existing instance in place. Previously the event
+went to the existing instance and the newcomer was dropped untracked. Destroying such an inert
+newcomer no longer clears the active instance, and its requests no longer drive the seat.
 
 `DrmSurface::use_vrr(false)` now succeeds as a no-op when using legacy DRM. Attempts to enable VRR
 on legacy DRM still return `UnknownProperty`.
