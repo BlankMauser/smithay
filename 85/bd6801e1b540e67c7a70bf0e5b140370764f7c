@@ -1,0 +1,21 @@
+CHANGELOG.md
+  s_1a65d9928dbb59::t_0b0ea3eff2e0bb 247-253
+Cargo.toml
+  s_1a65d9928dbb59::t_46cef391560e33 87-90
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "85bd6801e1b540e67c7a70bf0e5b140370764f7c",
+  "prompts": {},
+  "sessions": {
+    "s_1a65d9928dbb59": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "113f0a78-0cf1-4510-9a98-7c2a7d1abe36",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": null
+    }
+  }
+}
