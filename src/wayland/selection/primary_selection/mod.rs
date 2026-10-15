@@ -172,6 +172,9 @@ pub struct PrimaryDeviceManagerGlobalData {
 /// Set the primary selection focus to a certain client for a given seat
 ///
 /// If the focus is different from the existing focus, the current selection will be offered to the client.
+/// The client losing the focus is sent an empty primary selection, and the offers it was given can no
+/// longer be read: an offer is valid only until the next primary selection or the focus moves.
+/// Data-control devices do not follow the focus and are not affected.
 #[instrument(name = "wayland_primary_selection", level = "debug", skip(dh, seat, client), fields(seat = seat.name(), client = ?client.as_ref().map(|c| c.id())))]
 pub fn set_primary_focus<D>(dh: &DisplayHandle, seat: &Seat<D>, client: Option<Client>)
 where

@@ -1,4 +1,5 @@
 use wayland_protocols_wlr::data_control::v1::server::zwlr_data_control_device_v1::EVT_PRIMARY_SELECTION_SINCE;
+use wayland_server::backend::ClientId;
 use wayland_server::protocol::wl_data_device::WlDataDevice;
 use wayland_server::{Client, DisplayHandle, Resource};
 
@@ -15,6 +16,11 @@ pub(crate) struct SeatData<U: Clone + Sync + Send + 'static> {
     clipboard_selection_focus: Option<Client>,
     primary_selection: Option<OfferReplySource<U>>,
     primary_selection_focus: Option<Client>,
+    /// Advanced whenever the clipboard selection or its focus changes: a
+    /// `wl_data_offer` made at an older generation is no longer readable.
+    clipboard_generation: u64,
+    /// The same for the primary selection.
+    primary_generation: u64,
 }
 
 impl<U: Clone + Send + Sync + 'static> SeatData<U> {
@@ -49,7 +55,9 @@ impl<U: Clone + Send + Sync + 'static> SeatData<U> {
         D: SelectionHandler<SelectionUserData = U> + 'static,
     {
         if self.clipboard_selection_focus != new_focus {
-            self.clipboard_selection_focus = new_focus;
+            let old_focus = std::mem::replace(&mut self.clipboard_selection_focus, new_focus);
+            self.clipboard_generation += 1;
+            self.unset_for(dh, SelectionTarget::Clipboard, old_focus.as_ref());
             self.send_selection::<D>(dh, SelectionTarget::Clipboard, None, false)
         }
     }
@@ -70,6 +78,7 @@ impl<U: Clone + Send + Sync + 'static> SeatData<U> {
             }
         }
         self.clipboard_selection = new_selection;
+        self.clipboard_generation += 1;
         self.send_selection::<D>(dh, SelectionTarget::Clipboard, None, true)
     }
 
@@ -82,7 +91,9 @@ impl<U: Clone + Send + Sync + 'static> SeatData<U> {
         D: SelectionHandler<SelectionUserData = U> + 'static,
     {
         if self.primary_selection_focus != new_focus {
-            self.primary_selection_focus = new_focus;
+            let old_focus = std::mem::replace(&mut self.primary_selection_focus, new_focus);
+            self.primary_generation += 1;
+            self.unset_for(dh, SelectionTarget::Primary, old_focus.as_ref());
             self.send_selection::<D>(dh, SelectionTarget::Primary, None, false)
         }
     }
@@ -100,7 +111,40 @@ impl<U: Clone + Send + Sync + 'static> SeatData<U> {
             }
         }
         self.primary_selection = new_selection;
+        self.primary_generation += 1;
         self.send_selection::<D>(dh, SelectionTarget::Primary, None, true)
+    }
+
+    /// Tell `client`, which just lost the focus for `ty`, that it no longer has a
+    /// selection: its offer stopped being valid with the focus (the protocol says
+    /// so), and its devices hear it instead of keeping a stale offer around.
+    fn unset_for(&self, dh: &DisplayHandle, ty: SelectionTarget, client: Option<&Client>) {
+        let Some(client) = client else {
+            return;
+        };
+        for device in &self.known_devices {
+            let owned = dh.get_client(device.id()).is_ok_and(|c| &c == client);
+            match device {
+                SelectionDevice::DataDevice(_) if owned && ty == SelectionTarget::Clipboard => {
+                    device.unset_selection()
+                }
+                SelectionDevice::Primary(_) if owned && ty == SelectionTarget::Primary => {
+                    device.unset_primary_selection()
+                }
+                _ => (),
+            }
+        }
+    }
+
+    /// Whether a focus-following offer made at `generation` for `ty` may still be
+    /// read by `client`: no selection or focus change since, and `client` holds
+    /// the focus. Data-control offers are not gated.
+    pub fn offer_is_current(&self, ty: SelectionTarget, generation: u64, client: &ClientId) -> bool {
+        let (current, focus) = match ty {
+            SelectionTarget::Clipboard => (self.clipboard_generation, &self.clipboard_selection_focus),
+            SelectionTarget::Primary => (self.primary_generation, &self.primary_selection_focus),
+        };
+        current == generation && focus.as_ref().is_some_and(|focus| &focus.id() == client)
     }
 
     /// Get the current selection which will be used as a clipboard selection.
@@ -131,11 +175,16 @@ impl<U: Clone + Send + Sync + 'static> SeatData<U> {
     ) where
         D: SelectionHandler<SelectionUserData = U> + 'static,
     {
-        let (client, selection) = match ty {
-            SelectionTarget::Primary => (self.primary_selection_focus.as_ref(), &mut self.primary_selection),
+        let (client, selection, generation) = match ty {
+            SelectionTarget::Primary => (
+                self.primary_selection_focus.as_ref(),
+                &mut self.primary_selection,
+                self.primary_generation,
+            ),
             SelectionTarget::Clipboard => (
                 self.clipboard_selection_focus.as_ref(),
                 &mut self.clipboard_selection,
+                self.clipboard_generation,
             ),
         };
 
@@ -197,7 +246,13 @@ impl<U: Clone + Send + Sync + 'static> SeatData<U> {
                         None => continue,
                     };
 
-                    let offer = SelectionOffer::new::<D>(dh, device, client_id, selection.clone());
+                    // Offers that follow keyboard focus are readable only while they
+                    // are current; data-control offers are not gated.
+                    let gate = match device {
+                        SelectionDevice::WlrDataControl(_) | SelectionDevice::ExtDataControl(_) => None,
+                        _ => Some((ty, generation)),
+                    };
+                    let offer = SelectionOffer::new::<D>(dh, device, client_id, selection.clone(), gate);
 
                     device.offer(&offer);
 
@@ -223,6 +278,8 @@ impl<U: Clone + Send + Sync + 'static> Default for SeatData<U> {
             clipboard_selection_focus: None,
             primary_selection: None,
             primary_selection_focus: None,
+            clipboard_generation: 0,
+            primary_generation: 0,
         }
     }
 }

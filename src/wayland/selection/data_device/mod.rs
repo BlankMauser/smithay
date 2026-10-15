@@ -624,6 +624,9 @@ pub fn default_action_chooser(available: WlDndAction, preferred: WlDndAction) ->
 /// Set the data device focus to a certain client for a given seat
 ///
 /// If the focus is different from the existing focus, the current selection will be offered to the client.
+/// The client losing the focus is sent an empty selection, and the offers it was given can no longer
+/// be read (`wl_data_offer.receive` is refused): an offer is valid only until the next selection or the
+/// focus moves. Data-control devices do not follow the focus and are not affected.
 #[instrument(name = "wayland_data_device", level = "debug", skip(dh, seat, client), fields(seat = seat.name(), client = ?client.as_ref().map(|c| c.id())))]
 pub fn set_data_device_focus<D>(dh: &DisplayHandle, seat: &Seat<D>, client: Option<Client>)
 where

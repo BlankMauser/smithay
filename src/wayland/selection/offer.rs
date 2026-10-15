@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::os::unix::io::OwnedFd;
 use std::sync::Arc;
 
@@ -24,10 +25,11 @@ use zwp_primary_selection_offer_v1::Request as PrimaryRequest;
 
 use crate::input::Seat;
 
-use super::SelectionHandler;
 use super::device::{DataDeviceKind, SelectionDevice};
 use super::private::selection_dispatch;
+use super::seat_data::SeatData;
 use super::source::{CompositorSelectionProvider, SelectionSourceProvider};
+use super::{SelectionHandler, SelectionTarget};
 
 #[derive(Debug, Clone)]
 pub enum OfferReplySource<U: Clone + Send + Sync + 'static> {
@@ -70,6 +72,7 @@ impl SelectionOffer {
         device: &SelectionDevice,
         client_id: ClientId,
         data: OfferReplySource<D::SelectionUserData>,
+        gate: Option<(SelectionTarget, u64)>,
     ) -> Self
     where
         D: SelectionHandler + 'static,
@@ -82,6 +85,7 @@ impl SelectionOffer {
             device_kind,
             seat: device.seat(),
             source: data,
+            gate,
         });
         let backend = dh.backend_handle();
 
@@ -117,6 +121,9 @@ struct OfferReplyData<U: Clone + Send + Sync + 'static> {
     device_kind: DataDeviceKind,
     source: OfferReplySource<U>,
     seat: WlSeat,
+    /// For offers that follow keyboard focus: the selection and its generation
+    /// when the offer was made ([`SeatData::offer_is_current`]).
+    gate: Option<(SelectionTarget, u64)>,
 }
 
 impl<D> ObjectData<D> for OfferReplyData<D::SelectionUserData>
@@ -127,7 +134,7 @@ where
         self: Arc<Self>,
         dh: &Handle,
         handle: &mut D,
-        _: ClientId,
+        client_id: ClientId,
         msg: Message<ObjectId, OwnedFd>,
     ) -> Option<Arc<dyn ObjectData<D>>> {
         let dh = DisplayHandle::from(dh.clone());
@@ -174,7 +181,20 @@ where
             }
         };
 
-        if !self.source.contains_mime_type(&mime_type) {
+        let seat = Seat::<D>::from_resource(&self.seat);
+        let current = match self.gate {
+            None => true,
+            Some((ty, generation)) => seat.as_ref().is_some_and(|seat| {
+                seat.user_data()
+                    .get::<RefCell<SeatData<D::SelectionUserData>>>()
+                    .is_some_and(|data| data.borrow().offer_is_current(ty, generation, &client_id))
+            }),
+        };
+
+        if !current {
+            // The fd is dropped: the reader sees end of file at once.
+            debug!("Denying a {object_name}.receive on an offer that is stale or whose client lost focus");
+        } else if !self.source.contains_mime_type(&mime_type) {
             debug!("Denying a {object_name}.receive with invalid mime type");
         } else {
             match &self.source {
@@ -182,7 +202,7 @@ where
                     source.send(mime_type, fd);
                 }
                 OfferReplySource::Compositor(source) => {
-                    if let Some(seat) = Seat::<D>::from_resource(&self.seat) {
+                    if let Some(seat) = seat {
                         handle.send_selection(source.ty, mime_type, fd, seat, &source.user_data);
                     }
                 }

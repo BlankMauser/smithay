@@ -24,6 +24,8 @@ mod device;
 mod offer;
 mod seat_data;
 mod source;
+#[cfg(test)]
+mod tests;
 
 pub use source::SelectionSource;
 
