@@ -1,0 +1,21 @@
+src/wayland/selection/offer.rs
+  s_570999abbea358::t_c2679b202fb9ce 1,28-29,75,88,124-126,137,184-197,205
+src/wayland/selection/seat_data.rs
+  s_570999abbea358::t_85cbc3ed3bde0f 3,19-23,58-60,81,94-96,114,118-149,178-183,187,249-255,281-282
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "1e54834f9d79f950a6c2912281b8d61221c7c9d7",
+  "prompts": {},
+  "sessions": {
+    "s_570999abbea358": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3ea12033-5493-4d8d-9009-8cd7e79b44b4",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "BlankMauser <thomasluvan@gmail.com>"
+    }
+  }
+}
