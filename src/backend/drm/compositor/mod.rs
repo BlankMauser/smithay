@@ -759,6 +759,21 @@ impl<B: Buffer, F: Framebuffer> FrameState<B, F> {
     }
 
     #[profiling::function]
+    fn page_flip_async(
+        &mut self,
+        surface: &DrmSurface,
+        supports_fencing: bool,
+        allow_partial_update: bool,
+        event: bool,
+    ) -> Result<(), crate::backend::drm::error::Error> {
+        debug_assert!(!self.planes.iter().any(|(_, state)| state.needs_test));
+        surface.page_flip_async(
+            self.build_planes(surface, supports_fencing, allow_partial_update),
+            event,
+        )
+    }
+
+    #[profiling::function]
     fn build_planes<'a>(
         &'a mut self,
         surface: &'a DrmSurface,
@@ -944,6 +959,8 @@ impl From<&PlaneInfo> for PlaneAssignment {
 struct PendingFrame<A: Allocator, F: ExportFramebuffer<<A as Allocator>::Buffer>, U> {
     frame: CompositorFrameState<A, F>,
     user_data: U,
+    /// The kernel accepted this frame as an asynchronous (tearing) flip.
+    async_flip: bool,
 }
 
 impl<A, F, U> std::fmt::Debug for PendingFrame<A, F, U>
@@ -958,6 +975,7 @@ where
         f.debug_struct("PendingFrame")
             .field("frame", &self.frame)
             .field("user_data", &self.user_data)
+            .field("async_flip", &self.async_flip)
             .finish()
     }
 }
@@ -965,6 +983,8 @@ where
 struct QueuedFrame<A: Allocator, F: ExportFramebuffer<<A as Allocator>::Buffer>, U> {
     prepared_frame: PreparedFrame<A, F>,
     user_data: U,
+    /// Queued with [`DrmCompositor::queue_frame_async`]: try an asynchronous flip.
+    async_flip: bool,
 }
 
 impl<A, F, U> std::fmt::Debug for QueuedFrame<A, F, U>
@@ -979,6 +999,7 @@ where
         f.debug_struct("QueuedFrame")
             .field("prepared_frame", &self.prepared_frame)
             .field("user_data", &self.user_data)
+            .field("async_flip", &self.async_flip)
             .finish()
     }
 }
@@ -1061,6 +1082,7 @@ where
     primary_plane_element_id: Id,
     primary_plane_damage_bag: DamageBag<i32, BufferCoords>,
     supports_fencing: bool,
+    supports_async_flip: bool,
     reset_pending: bool,
     signaled_fence: Option<Arc<OwnedFd>>,
 
@@ -1204,6 +1226,7 @@ where
                 })?
             && plane_has_property(&*surface, surface.plane(), "IN_FENCE_FD")?
             && !(is_nvidia && nvidia_drm_version().unwrap_or((0, 0, 0)) < (560, 35, 3));
+        let supports_async_flip = surface.supports_async_page_flip();
 
         for format in color_formats {
             debug!("Testing color format: {}", format);
@@ -1267,6 +1290,7 @@ where
                         opaque_regions: Vec::new(),
                         element_opaque_regions_workhouse: Vec::new(),
                         supports_fencing,
+                        supports_async_flip,
                         debug_flags: DebugFlags::empty(),
                         span,
                     };
@@ -1387,6 +1411,7 @@ where
                 })?
             && plane_has_property(&*surface, surface.plane(), "IN_FENCE_FD")?
             && !(is_nvidia && nvidia_drm_version().unwrap_or((0, 0, 0)) < (560, 35, 3));
+        let supports_async_flip = surface.supports_async_page_flip();
 
         let (swapchain, is_opaque) = Self::test_format(
             &surface,
@@ -1449,6 +1474,7 @@ where
             opaque_regions: Vec::new(),
             element_opaque_regions_workhouse: Vec::new(),
             supports_fencing,
+            supports_async_flip,
             debug_flags: DebugFlags::empty(),
             span,
         };
@@ -2439,6 +2465,40 @@ where
     /// `user_data` can be used to attach some data to a specific buffer and later retrieved with [`DrmCompositor::frame_submitted`]
     #[profiling::function]
     pub fn queue_frame(&mut self, user_data: U) -> FrameResult<(), A, F> {
+        self.queue_frame_with(user_data, false)
+    }
+
+    /// Queues the current frame for scan-out as soon as possible: like
+    /// [`DrmCompositor::queue_frame`], but the flip is submitted asynchronously
+    /// (`DRM_MODE_PAGE_FLIP_ASYNC`), so the frame may tear instead of waiting for the
+    /// next vblank.
+    ///
+    /// The flip falls back to a regular vblank-synchronized one when the device does not
+    /// support asynchronous flips ([`DrmCompositor::supports_async_page_flip`]), when the
+    /// frame needs a full commit (a mode, connector or VRR change), or when the kernel
+    /// refuses it, which it does for any change beyond the primary plane's framebuffer
+    /// (for example a moving cursor plane). [`DrmCompositor::pending_frame_async`] tells
+    /// which kind of flip is in flight. Either way the flip completes with an event that
+    /// must be followed by [`DrmCompositor::frame_submitted`].
+    #[profiling::function]
+    pub fn queue_frame_async(&mut self, user_data: U) -> FrameResult<(), A, F> {
+        self.queue_frame_with(user_data, true)
+    }
+
+    /// Whether the device accepts asynchronous page flips on this surface (see
+    /// [`DrmSurface::supports_async_page_flip`]).
+    pub fn supports_async_page_flip(&self) -> bool {
+        self.supports_async_flip
+    }
+
+    /// Whether the flip in flight, which the next [`DrmCompositor::frame_submitted`]
+    /// completes, was submitted asynchronously (it may tear). `false` when no flip is
+    /// in flight.
+    pub fn pending_frame_async(&self) -> bool {
+        self.pending_frame.as_ref().is_some_and(|frame| frame.async_flip)
+    }
+
+    fn queue_frame_with(&mut self, user_data: U, async_flip: bool) -> FrameResult<(), A, F> {
         if !self.surface.is_active() {
             return Err(FrameErrorType::<A, F>::DrmError(DrmError::DeviceInactive));
         }
@@ -2464,6 +2524,7 @@ where
         self.queued_frame = Some(QueuedFrame {
             prepared_frame,
             user_data,
+            async_flip,
         });
         if self.pending_frame.is_none() {
             self.submit()?;
@@ -2542,13 +2603,42 @@ where
         let QueuedFrame {
             mut prepared_frame,
             user_data,
+            async_flip,
         } = self.queued_frame.take().unwrap();
 
         let allow_partial_update = prepared_frame.kind == PreparedFrameKind::Partial;
+        let mut flipped_async = false;
         let flip = if self.surface.commit_pending() {
+            // A mode, connector or VRR change needs a full commit, never an async one.
             prepared_frame
                 .frame
                 .commit(&self.surface, self.supports_fencing, allow_partial_update, true)
+        } else if async_flip && self.supports_async_flip {
+            match prepared_frame.frame.page_flip_async(
+                &self.surface,
+                self.supports_fencing,
+                allow_partial_update,
+                true,
+            ) {
+                Ok(()) => {
+                    flipped_async = true;
+                    Ok(())
+                }
+                Err(err) => {
+                    // The kernel refuses async flips that change more than the primary
+                    // plane's framebuffer: present this frame at the next vblank instead.
+                    trace!(
+                        ?err,
+                        "asynchronous page flip refused, flipping at the next vblank"
+                    );
+                    prepared_frame.frame.page_flip(
+                        &self.surface,
+                        self.supports_fencing,
+                        allow_partial_update,
+                        true,
+                    )
+                }
+            }
         } else {
             prepared_frame
                 .frame
@@ -2561,6 +2651,7 @@ where
             self.pending_frame = Some(PendingFrame {
                 frame: prepared_frame.frame,
                 user_data,
+                async_flip: flipped_async,
             });
         }
 
@@ -2616,7 +2707,10 @@ where
     /// Otherwise the underlying swapchain will run out of buffers eventually.
     #[profiling::function]
     pub fn frame_submitted(&mut self) -> FrameResult<Option<U>, A, F> {
-        if let Some(PendingFrame { mut frame, user_data }) = self.pending_frame.take() {
+        if let Some(PendingFrame {
+            mut frame, user_data, ..
+        }) = self.pending_frame.take()
+        {
             std::mem::swap(&mut frame, &mut self.current_frame);
             if self.queued_frame.is_some() {
                 self.submit()?;
