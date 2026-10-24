@@ -244,6 +244,13 @@ it is `unavailable`, per the protocol, leaving the existing instance in place. P
 went to the existing instance and the newcomer was dropped untracked. Destroying such an inert
 newcomer no longer clears the active instance, and its requests no longer drive the seat.
 
+Selection offers now follow keyboard focus as the protocols describe: a `wl_data_offer` or
+`zwp_primary_selection_offer_v1` is valid only until the next selection or until its client loses
+the focus. `set_data_device_focus` and `set_primary_focus` send an empty selection to the client
+losing the focus, and a `receive` on an offer that is no longer current is refused (the fd is
+closed unwritten), so a client that was focused once can no longer read later selections.
+Data-control offers do not follow focus and are unchanged.
+
 `DrmSurface::use_vrr(false)` now succeeds as a no-op when using legacy DRM. Attempts to enable VRR
 on legacy DRM still return `UnknownProperty`.
 
